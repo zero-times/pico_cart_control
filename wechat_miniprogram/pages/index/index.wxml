@@ -1,0 +1,142 @@
+<view class="page">
+  <view class="topbar">
+    <view>
+      <text class="title">Pico Cart Debug</text>
+      <text class="subtitle">{{connected ? deviceName : (adapterReady ? '蓝牙已就绪' : '蓝牙未初始化')}}</text>
+    </view>
+    <view class="badge {{connected ? 'badge-ok' : 'badge-warn'}}">{{connected ? '已连接' : '未连接'}}</view>
+  </view>
+
+  <view class="toolbar">
+    <button class="tool-button primary" bindtap="initBluetooth" loading="{{connecting}}">蓝牙</button>
+    <button class="tool-button" bindtap="startScan" disabled="{{!adapterReady || scanning}}">扫描</button>
+    <button class="tool-button" bindtap="stopScan" disabled="{{!scanning}}">停扫</button>
+    <button class="tool-button danger" bindtap="disconnect" disabled="{{!connected}}">断开</button>
+  </view>
+
+  <view wx:if="{{!connected}}" class="section">
+    <view class="section-head">
+      <text>设备</text>
+      <text class="muted">{{scanning ? '扫描中' : devices.length + ' 个'}}</text>
+    </view>
+    <scroll-view class="device-list" scroll-y>
+      <view wx:for="{{devices}}" wx:key="deviceId" class="device-row" data-id="{{item.deviceId}}" bindtap="connectTap">
+        <view class="device-main">
+          <view class="device-name">{{item.name}}</view>
+          <view class="device-id mono">{{item.deviceId}}</view>
+        </view>
+        <view class="device-side">
+          <text class="rssi">{{item.rssi}} dBm</text>
+          <button class="mini-button identify-small" data-id="{{item.deviceId}}" catchtap="connectIdentifyTap">连接闪灯</button>
+        </view>
+      </view>
+    </scroll-view>
+  </view>
+
+  <view wx:if="{{connected}}" class="section">
+    <view class="section-head">
+      <text>状态</text>
+      <text class="muted mono">{{status.mode}} / {{status.sensor}}</text>
+    </view>
+    <view class="status-grid">
+      <view class="metric">
+        <text class="metric-label">总拉力</text>
+        <text class="metric-value mono">{{status.total}}</text>
+      </view>
+      <view class="metric">
+        <text class="metric-label">转向</text>
+        <text class="metric-value mono">{{status.steer}}</text>
+      </view>
+      <view class="metric">
+        <text class="metric-label">左 PWM</text>
+        <text class="metric-value mono">{{status.pwml}}</text>
+      </view>
+      <view class="metric">
+        <text class="metric-label">右 PWM</text>
+        <text class="metric-value mono">{{status.pwmr}}</text>
+      </view>
+      <view class="metric">
+        <text class="metric-label">左传感</text>
+        <text class="metric-value mono">{{status.l}}</text>
+      </view>
+      <view class="metric">
+        <text class="metric-label">右传感</text>
+        <text class="metric-value mono">{{status.r}}</text>
+      </view>
+    </view>
+    <view class="status-line mono">estop={{status.estop}} unsafe={{status.unsafe}} err={{status.err}}</view>
+  </view>
+
+  <view wx:if="{{connected}}" class="section">
+    <view class="section-head">
+      <text>控制</text>
+      <text class="muted">{{streaming ? 'stream on' : 'stream off'}}</text>
+    </view>
+    <view class="action-row compact-actions">
+      <button class="action stop" bindtap="sendStop">停止</button>
+      <button class="action" bindtap="sendAuto">自动</button>
+      <button class="action" bindtap="sendManual">手动</button>
+      <button class="action" bindtap="sendTare">归零</button>
+      <button class="action" bindtap="sendIdentify">闪灯</button>
+      <button class="action" bindtap="toggleStream">{{streaming ? '关流' : '开流'}}</button>
+      <button class="action" bindtap="sendStatus">状态</button>
+    </view>
+
+    <view class="manual">
+      <view class="manual-power">
+        <text>手动功率</text>
+        <text class="mono">{{manualPower}}%</text>
+      </view>
+      <slider min="5" max="25" step="1" value="{{manualPower}}" bindchange="onPowerChange" activeColor="#2f7de1" block-size="22" />
+      <view class="pad-wrap">
+        <view class="drive-pad">
+          <view class="drive-row drive-row-center">
+            <view class="drive-key drive-wide" data-dir="forward" catchtouchstart="holdDrive" catchtouchend="releaseDrive" catchtouchcancel="releaseDrive" catchtap="tapDrive">前</view>
+          </view>
+          <view class="drive-row">
+            <view class="drive-key" data-dir="left" catchtouchstart="holdDrive" catchtouchend="releaseDrive" catchtouchcancel="releaseDrive" catchtap="tapDrive">左</view>
+            <view class="drive-key drive-stop" bindtap="sendStop">停</view>
+            <view class="drive-key" data-dir="right" catchtouchstart="holdDrive" catchtouchend="releaseDrive" catchtouchcancel="releaseDrive" catchtap="tapDrive">右</view>
+          </view>
+          <view class="drive-row drive-row-center">
+            <view class="drive-key drive-wide" data-dir="backward" catchtouchstart="holdDrive" catchtouchend="releaseDrive" catchtouchcancel="releaseDrive" catchtap="tapDrive">后</view>
+          </view>
+        </view>
+      </view>
+    </view>
+  </view>
+
+  <view wx:if="{{connected}}" class="section">
+    <view class="section-head">
+      <text>参数</text>
+      <button class="mini-button" bindtap="sendParamQuery">刷新</button>
+    </view>
+    <view class="param-grid">
+      <view class="param-row" wx:for="{{paramRows}}" wx:key="key">
+        <text class="param-name mono">{{item.key}}</text>
+        <input class="param-input mono" value="{{item.value}}" data-key="{{item.key}}" data-index="{{index}}" bindinput="onParamInput" />
+        <button class="mini-button" data-key="{{item.key}}" bindtap="applyParam">写入</button>
+      </view>
+    </view>
+  </view>
+
+  <view wx:if="{{connected}}" class="section">
+    <view class="section-head">
+      <text>命令</text>
+      <text class="muted">{{logs.length}} 条</text>
+    </view>
+    <view class="command-row">
+      <input class="command-input mono" value="{{customCommand}}" bindinput="onCustomInput" placeholder="status" />
+      <button class="tool-button primary" bindtap="sendCustom">发送</button>
+    </view>
+    <view class="log-actions">
+      <button class="mini-button" bindtap="shareLogs">发送好友</button>
+      <button class="mini-button" bindtap="saveLogsToFile">保存文件</button>
+      <button class="mini-button" bindtap="copyLogs">复制日志</button>
+      <button class="mini-button danger" bindtap="clearLog">清空</button>
+    </view>
+    <scroll-view class="log" scroll-y scroll-into-view="{{logAnchor}}">
+      <view wx:for="{{logs}}" wx:key="id" id="{{item.id}}" class="log-line mono">{{item.text}}</view>
+    </scroll-view>
+  </view>
+</view>

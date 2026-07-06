@@ -1,0 +1,13 @@
+{
+  "pages": [
+    "pages/index/index"
+  ],
+  "window": {
+    "navigationBarTitleText": "Pico Cart Debug",
+    "navigationBarBackgroundColor": "#f6f8fb",
+    "navigationBarTextStyle": "black",
+    "backgroundColor": "#f6f8fb"
+  },
+  "style": "v2",
+  "sitemapLocation": "sitemap.json"
+}
