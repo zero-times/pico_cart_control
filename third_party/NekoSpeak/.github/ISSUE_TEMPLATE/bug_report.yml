@@ -1,0 +1,61 @@
+name: Bug report
+description: Report a reproducible problem in NekoSpeak
+title: "Bug: "
+labels: [bug, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug.
+        Please attach the support report zip generated in Settings -> About -> Generate Support Report.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened?
+      placeholder: Briefly describe the problem.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: List exact steps so we can reproduce.
+      placeholder: |
+        1. Open ...
+        2. Tap ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      placeholder: What happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Paste the prefilled environment details if missing.
+      placeholder: App version, Android version, device, model, voice
+
+  - type: input
+    id: support_report
+    attributes:
+      label: Support report filename
+      description: Name of attached support report zip
+      placeholder: support_report_YYYYMMDD_HHMMSS.zip

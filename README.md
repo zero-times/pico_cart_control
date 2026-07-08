@@ -440,3 +440,111 @@ MOTOR_TEST_MODE = True
 ```
 
 两个轮子必须架空。
+
+## Android 调试端
+
+Android 原生 App 工程在：
+
+```text
+android_app/
+```
+
+当前 Android 端已经迁移微信小程序的核心调试功能：
+
+1. BLE 权限申请、扫描、停止扫描、连接和断开。
+2. 自动选择常见 BLE UART/GATT 通道：Nordic UART `6E400001...`、`FFE0/FFE1`、`FFF0/FFF1`，并兜底选择同一 service 下的可写 characteristic 与 notify characteristic。
+3. 连接后自动发送 `status` 和 `param`。
+4. 解析 `stat`、`param`、`info`、`ok stream=...` 行协议。
+5. 支持 `stop`、`auto`、`manual`、`tare`、`identify 5`、`stream on/off`、`status`、自定义命令。
+6. 支持手动功率滑块和方向键长按重复发送 `f/b/l/r`，松手自动 `stop`。
+7. 支持参数刷新、逐项写入、日志复制、保存和分享。
+8. 增加文字转语音抽象层，状态页可以朗读当前模式、传感器、拉力和 PWM。
+9. 增加轻量 Agent Host V1：Android App 调 DeepSeek Tool Calls，本地执行安全工具，再通过 BLE 给 Pico 发命令。
+
+构建调试 APK：
+
+```bash
+cd android_app
+./gradlew :app:assembleDebug
+```
+
+生成文件：
+
+```text
+android_app/app/build/outputs/apk/debug/app-debug.apk
+```
+
+安装到已连接的 Android 设备：
+
+```bash
+cd android_app
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+Android 12 及以上会请求 `BLUETOOTH_SCAN` 和 `BLUETOOTH_CONNECT`；Android 11 及以下会请求蓝牙扫描所需的位置权限。BLE 调试不需要网络；AI 助手页会使用 `INTERNET` 权限调用 DeepSeek API。
+语音唤醒会请求 `RECORD_AUDIO` 权限。
+
+## Android Agent Host V1
+
+最新设计指导见：
+
+```text
+ANDROID_DEEPSEEK_TOOL_CALL_AGENT_GUIDE.md
+```
+
+当前 V1 已实现：
+
+1. `SessionStore`：SQLite 保存 `sessions`、`messages`、`tool_calls`、`cart_status_log`。
+2. `DeepSeekClient`：通过 `https://api.deepseek.com/chat/completions` 调用 DeepSeek，支持 `tools` 和 `tool_calls`。
+3. `ToolRegistry`：内置 `cart_get_status`、`cart_stop`、`cart_set_mode`、`cart_move`、`cart_turn`。
+4. `SafetyGuard`：拒绝未知工具、急停/故障下的移动、超长 duration、超限 speed_level、未解锁移动。
+5. `AgentRuntime`：执行 tool-call 循环，保存工具日志，把 tool result 发回 DeepSeek。
+6. `CartHardware` BLE 适配：把工具调用转换为现有 Pico 行协议，例如 `status`、`stop`、`manual`、`auto`、`f/b/l/r <power>`。
+7. Compose UI：底部入口分为 `调试` 和 `助手`，助手页可填写 DeepSeek API Key、查看对话/工具日志，并手动解锁移动工具。
+8. 曼波语音链路：助手角色名为“曼波”；打开 `曼波唤醒` 后，App 使用 `AudioRecord` 常驻采样、本地 VAD 切段、本地 Vosk STT 识别唤醒词和指令。说出“曼波”后进入 `听指令`，把后面一段语音转文字发送给 DeepSeek；如果同一句已经包含命令，也会直接执行。
+9. 曼波朗读协议：DeepSeek 最终响应中的 `<mambo_say>...</mambo_say>` 会被 App 提取并朗读；普通响应仍显示在对话里并照常执行工具调用。
+
+安全边界：
+
+1. DeepSeek 只返回工具调用建议，不直接控制硬件。
+2. Android App 本地校验工具名和参数。
+3. `cart_move` 和 `cart_turn` 默认被 UI 移动锁拦截，必须在助手页手动解锁。
+4. Pico 固件仍必须保留看门狗、急停、缓启动、限速和传感器异常停车。
+5. 当前没有提供 `raw_serial_write`、`raw_gpio_write`、`set_left_pwm`、`disable_estop` 这类裸控制工具。
+
+DeepSeek API Key 保存在 Android App 本地 `SharedPreferences`，不会写入仓库。默认模型使用 DeepSeek 当前推荐的 `deepseek-v4-flash`，thinking 默认关闭。
+
+语音使用方式：
+
+1. 进入 Android App 的 `助手` 页。
+2. 填写 DeepSeek API Key。
+3. 安装离线中文模型：
+
+```bash
+cd android_app
+./scripts/download_vosk_cn_model.sh
+./gradlew :app:assembleDebug
+```
+
+4. 打开 `曼波唤醒`，授予录音权限。
+5. 可以直接说：`曼波，读取状态`、`曼波，进入调试模式`、`曼波，低速前进两百毫秒`。
+6. 也可以先说 `曼波`，等状态变成 `听指令` 后再说：`读取状态`、`进入调试模式`。
+7. App 会显示识别到的文本、工具执行日志和普通响应，并朗读 `mambo_say` 片段。
+
+当前语音唤醒是 App 内监听，不是系统级后台热词。需要 App 运行且 `曼波唤醒` 开关打开。语音链路不再调用 Android `SpeechRecognizer`，因此不会触发系统识别服务的开始/结束提示音；如果没有安装 `model-cn`，助手页会提示“未安装本地语音模型”并保持关闭。
+
+## NekoSpeak 文字转语音模块
+
+已从上游拉取 NekoSpeak 源码到：
+
+```text
+third_party/NekoSpeak/
+```
+
+拉取的上游 HEAD 记录在：
+
+```text
+third_party/NekoSpeak.UPSTREAM
+```
+
+NekoSpeak 是一个完整 Android TTS Engine 应用，包含 TTS Service、ONNX Runtime、JNI、模型资源和设置界面，不是可直接 `implementation(project(...))` 的轻量库。当前 Pico Cart Android App 先通过 `SpeechEngine` 抽象接入系统 `TextToSpeech`，后续如果要完全使用 NekoSpeak 离线引擎，建议把 `third_party/NekoSpeak/app/src/main/java/com/nekospeak/tts` 中的 engine/service 代码拆成 Android library module，再实现 `com.zerotimes.picocart.speech.SpeechEngine`。
