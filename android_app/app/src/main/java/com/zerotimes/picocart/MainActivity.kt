@@ -6,6 +6,16 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -13,6 +23,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -89,6 +100,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
@@ -96,6 +108,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -103,6 +116,7 @@ import com.zerotimes.picocart.ble.BleDeviceItem
 import com.zerotimes.picocart.speech.AndroidSpeechEngine
 import com.zerotimes.picocart.speech.MamboVoiceListener
 import com.zerotimes.picocart.ui.PicoCartTheme
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
@@ -147,6 +161,7 @@ private fun PicoCartApp(
             onCommand = viewModel::onMamboCommand,
             onStateChanged = viewModel::setMamboVoiceState,
             onErrorMessage = viewModel::onMamboVoiceError,
+            onDebugMessage = viewModel::onMamboVoiceDebug,
         )
     }
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -280,142 +295,268 @@ private fun PicoCartScreen(
     onRunAgent: () -> Unit,
     onToggleMamboWake: () -> Unit,
 ) {
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Text(
-                            if (selectedTab == "agent") "Pico Cart Agent" else "Pico Cart Debug",
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        Text(
-                            text = if (state.connected) state.deviceName else if (state.adapterReady) "蓝牙已就绪" else "蓝牙未初始化",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                },
-                actions = {
-                    StatusBadge(connected = state.connected)
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.surface,
-                ),
-            )
-        },
-        bottomBar = {
-            NavigationBar {
-                NavigationBarItem(
-                    selected = selectedTab == "debug",
-                    onClick = { onSelectTab("debug") },
-                    icon = { Icon(Icons.Filled.Bluetooth, contentDescription = null) },
-                    label = { Text("调试") },
+    Box(Modifier.fillMaxSize()) {
+        Scaffold(
+            topBar = {
+                TopAppBar(
+                    title = {
+                        Column {
+                            Text(
+                                if (selectedTab == "agent") "Pico Cart Agent" else "Pico Cart Debug",
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                text = if (state.connected) state.deviceName else if (state.adapterReady) "蓝牙已就绪" else "蓝牙未初始化",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    },
+                    actions = {
+                        StatusBadge(connected = state.connected)
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = MaterialTheme.colorScheme.surface,
+                    ),
                 )
-                NavigationBarItem(
-                    selected = selectedTab == "agent",
-                    onClick = { onSelectTab("agent") },
-                    icon = { Icon(Icons.AutoMirrored.Filled.Send, contentDescription = null) },
-                    label = { Text("助手") },
-                )
-            }
-        },
-    ) { innerPadding ->
-        LazyColumn(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(MaterialTheme.colorScheme.surface)
-                .padding(innerPadding)
-                .padding(horizontal = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            item {
-                Toolbar(
-                    state = state,
-                    onBluetooth = onBluetooth,
-                    onScan = onScan,
-                    onStopScan = onStopScan,
-                    onDisconnect = onDisconnect,
-                )
-            }
-
-            if (selectedTab == "agent") {
-                item {
-                    AgentSection(
-                        state = state,
-                        onAgentApiKeyInput = onAgentApiKeyInput,
-                        onAgentInput = onAgentInput,
-                        onToggleAgentMovement = onToggleAgentMovement,
-                        onRunAgent = onRunAgent,
-                        onToggleMamboWake = onToggleMamboWake,
+            },
+            bottomBar = {
+                NavigationBar {
+                    NavigationBarItem(
+                        selected = selectedTab == "debug",
+                        onClick = { onSelectTab("debug") },
+                        icon = { Icon(Icons.Filled.Bluetooth, contentDescription = null) },
+                        label = { Text("调试") },
+                    )
+                    NavigationBarItem(
+                        selected = selectedTab == "agent",
+                        onClick = { onSelectTab("agent") },
+                        icon = { Icon(Icons.AutoMirrored.Filled.Send, contentDescription = null) },
+                        label = { Text("助手") },
                     )
                 }
-                if (state.connected) {
-                    item { StatusSection(state = state, onSpeakStatus = onSpeakStatus) }
-                } else {
+            },
+        ) { innerPadding ->
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(MaterialTheme.colorScheme.surface)
+                    .padding(innerPadding)
+                    .padding(horizontal = 16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                item {
+                    Toolbar(
+                        state = state,
+                        onBluetooth = onBluetooth,
+                        onScan = onScan,
+                        onStopScan = onStopScan,
+                        onDisconnect = onDisconnect,
+                    )
+                }
+
+                if (selectedTab == "agent") {
                     item {
-                        DeviceSection(
-                            devices = state.devices,
-                            scanning = state.scanning,
-                            onConnect = onConnect,
-                            onConnectIdentify = onConnectIdentify,
+                        AgentSection(
+                            state = state,
+                            onAgentApiKeyInput = onAgentApiKeyInput,
+                            onAgentInput = onAgentInput,
+                            onToggleAgentMovement = onToggleAgentMovement,
+                            onRunAgent = onRunAgent,
+                            onToggleMamboWake = onToggleMamboWake,
                         )
+                    }
+                    if (state.connected) {
+                        item { StatusSection(state = state, onSpeakStatus = onSpeakStatus) }
+                    } else {
+                        item {
+                            DeviceSection(
+                                devices = state.devices,
+                                scanning = state.scanning,
+                                onConnect = onConnect,
+                                onConnectIdentify = onConnectIdentify,
+                            )
+                        }
+                    }
+                } else {
+                    if (!state.connected) {
+                        item {
+                            DeviceSection(
+                                devices = state.devices,
+                                scanning = state.scanning,
+                                onConnect = onConnect,
+                                onConnectIdentify = onConnectIdentify,
+                            )
+                        }
+                    } else {
+                        item { StatusSection(state = state, onSpeakStatus = onSpeakStatus) }
+                        item {
+                            ControlSection(
+                                state = state,
+                                onAuto = onAuto,
+                                onManual = onManual,
+                                onStop = onStop,
+                                onTare = onTare,
+                                onIdentify = onIdentify,
+                                onToggleStream = onToggleStream,
+                                onStatus = onStatus,
+                                onPowerChange = onPowerChange,
+                                onDrivePress = onDrivePress,
+                                onDriveRelease = onDriveRelease,
+                            )
+                        }
+                        item {
+                            ParamsSection(
+                                state = state,
+                                onParamQuery = onParamQuery,
+                                onParamInput = onParamInput,
+                                onApplyParam = onApplyParam,
+                            )
+                        }
+                        item {
+                            CommandLogSection(
+                                state = state,
+                                onCustomInput = onCustomInput,
+                                onSendCustom = onSendCustom,
+                                onCopyLogs = onCopyLogs,
+                                onSaveLogs = onSaveLogs,
+                                onShareLogs = onShareLogs,
+                                onClearLogs = onClearLogs,
+                            )
+                        }
                     }
                 }
-            } else {
-                if (!state.connected) {
-                    item {
-                        DeviceSection(
-                            devices = state.devices,
-                            scanning = state.scanning,
-                            onConnect = onConnect,
-                            onConnectIdentify = onConnectIdentify,
-                        )
-                    }
-                } else {
-                    item { StatusSection(state = state, onSpeakStatus = onSpeakStatus) }
-                    item {
-                        ControlSection(
-                            state = state,
-                            onAuto = onAuto,
-                            onManual = onManual,
-                            onStop = onStop,
-                            onTare = onTare,
-                            onIdentify = onIdentify,
-                            onToggleStream = onToggleStream,
-                            onStatus = onStatus,
-                            onPowerChange = onPowerChange,
-                            onDrivePress = onDrivePress,
-                            onDriveRelease = onDriveRelease,
-                        )
-                    }
-                    item {
-                        ParamsSection(
-                            state = state,
-                            onParamQuery = onParamQuery,
-                            onParamInput = onParamInput,
-                            onApplyParam = onApplyParam,
-                        )
-                    }
-                    item {
-                        CommandLogSection(
-                            state = state,
-                            onCustomInput = onCustomInput,
-                            onSendCustom = onSendCustom,
-                            onCopyLogs = onCopyLogs,
-                            onSaveLogs = onSaveLogs,
-                            onShareLogs = onShareLogs,
-                            onClearLogs = onClearLogs,
-                        )
-                    }
+
+                item { Spacer(Modifier.height(12.dp)) }
+            }
+        }
+        MamboVoiceOverlay(state = state)
+    }
+}
+
+@Composable
+private fun MamboVoiceOverlay(state: CartUiState) {
+    AnimatedVisibility(
+        visible = state.mamboOverlayVisible,
+        modifier = Modifier.fillMaxSize(),
+        enter = fadeIn(animationSpec = tween(180)) + scaleIn(
+            initialScale = 0.96f,
+            animationSpec = tween(180),
+        ),
+        exit = fadeOut(animationSpec = tween(180)) + scaleOut(
+            targetScale = 0.96f,
+            animationSpec = tween(180),
+        ),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.36f))
+                .padding(horizontal = 24.dp),
+            contentAlignment = Alignment.TopCenter,
+        ) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 88.dp),
+                shape = RoundedCornerShape(8.dp),
+                color = MaterialTheme.colorScheme.surface,
+                contentColor = MaterialTheme.colorScheme.onSurface,
+                tonalElevation = 6.dp,
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 22.dp, vertical = 24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    MamboVoiceOrb(
+                        active = state.mamboOverlayStatus == "听指令",
+                        modifier = Modifier.size(150.dp),
+                    )
+                    Spacer(Modifier.height(18.dp))
+                    Text(
+                        text = state.mamboOverlayStatus.ifBlank { state.mamboVoiceStatus },
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        text = state.mamboOverlayCaption.ifBlank { "..." },
+                        modifier = Modifier.fillMaxWidth(),
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        textAlign = TextAlign.Center,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
+                    )
                 }
             }
-
-            item { Spacer(Modifier.height(12.dp)) }
         }
+    }
+}
+
+@Composable
+private fun MamboVoiceOrb(
+    active: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val colors = MaterialTheme.colorScheme
+    val transition = rememberInfiniteTransition(label = "mambo-voice-orb")
+    val pulse by transition.animateFloat(
+        initialValue = if (active) 0.92f else 0.98f,
+        targetValue = if (active) 1.12f else 1.04f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(if (active) 820 else 1_400),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "pulse",
+    )
+    val drift by transition.animateFloat(
+        initialValue = -1f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(if (active) 1_200 else 1_900),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "drift",
+    )
+
+    Canvas(modifier = modifier) {
+        val diameter = min(size.width, size.height)
+        val center = Offset(size.width / 2f, size.height / 2f)
+        val baseRadius = diameter * 0.34f
+        drawCircle(
+            color = colors.primary.copy(alpha = 0.18f),
+            radius = diameter * 0.48f * pulse,
+            center = center,
+        )
+        drawCircle(
+            color = colors.tertiary.copy(alpha = 0.34f),
+            radius = baseRadius * (1.05f + drift * 0.04f),
+            center = center + Offset(diameter * 0.08f * drift, -diameter * 0.05f),
+        )
+        drawCircle(
+            color = colors.secondary.copy(alpha = 0.30f),
+            radius = baseRadius * (0.92f - drift * 0.04f),
+            center = center + Offset(-diameter * 0.11f * drift, diameter * 0.08f),
+        )
+        drawCircle(
+            color = colors.primary.copy(alpha = 0.42f),
+            radius = baseRadius * 0.74f * pulse,
+            center = center + Offset(diameter * 0.05f, diameter * 0.03f * drift),
+        )
+        drawCircle(
+            color = colors.surface.copy(alpha = 0.26f),
+            radius = baseRadius * 0.32f,
+            center = center + Offset(-diameter * 0.08f, -diameter * 0.10f),
+        )
     }
 }
 

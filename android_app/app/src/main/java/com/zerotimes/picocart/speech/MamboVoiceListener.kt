@@ -32,6 +32,7 @@ class MamboVoiceListener(
     private val onCommand: (String) -> Unit,
     private val onStateChanged: (MamboVoiceState) -> Unit,
     private val onErrorMessage: (String) -> Unit,
+    private val onDebugMessage: (String) -> Unit,
 ) {
     private enum class Stage {
         WAKE,
@@ -41,10 +42,12 @@ class MamboVoiceListener(
     private val appContext = context.applicationContext
     private val mainHandler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val wakeWordDetector = WakeWordDetector()
     private var job: Job? = null
     private var state = MamboVoiceState.OFF
     private var stage = Stage.WAKE
     private var commandDeadlineElapsedMs = 0L
+    private var lastDebugElapsedMs = 0L
 
     @Volatile
     private var enabled = false
@@ -90,6 +93,7 @@ class MamboVoiceListener(
             return
         }
         stage = Stage.WAKE
+        wakeWordDetector.reset()
         commandDeadlineElapsedMs = 0L
         job = scope.launch {
             publishState(MamboVoiceState.LOADING_MODEL)
@@ -141,11 +145,12 @@ class MamboVoiceListener(
                 }
                 handleCommandTimeout(now, vad)
 
-                val segment = vad.accept(frame, read) ?: continue
-                if (segment.durationMs < MIN_SEGMENT_MS) {
-                    continue
+                for (event in vad.accept(frame, read)) {
+                    when (event) {
+                        is VadEvent.Debug -> postDebug(event.log.format())
+                        is VadEvent.Segment -> handleSegment(recognizer, event.segment)
+                    }
                 }
-                handleSegment(recognizer, segment)
             }
         } finally {
             runCatching { audioRecord.stop() }
@@ -199,19 +204,16 @@ class MamboVoiceListener(
     }
 
     private fun handleWakeSegment(recognizer: LocalVoskSpeechRecognizer, segment: VoiceSegment) {
+        postDebug("送入唤醒识别：duration=${segment.durationMs}ms，vad=${segment.vadConfidence.formatScore()}")
         val wakeText = recognizer.transcribeWake(segment.pcmBytes)
-        if (!containsWakeWord(wakeText)) {
+        val result = wakeWordDetector.detect(
+            rawText = wakeText,
+            vadConfidence = segment.vadConfidence,
+            nowElapsedMs = SystemClock.elapsedRealtime(),
+        )
+        postWakeCandidate(result)
+        if (!result.matched) {
             publishState(MamboVoiceState.WAITING_WAKE)
-            return
-        }
-
-        val fullText = recognizer.transcribeCommand(segment.pcmBytes)
-        val command = extractWakeCommand(fullText).orEmpty()
-        if (command.isNotBlank()) {
-            stage = Stage.WAKE
-            commandDeadlineElapsedMs = 0L
-            publishState(MamboVoiceState.WAITING_WAKE)
-            postCommand(command)
             return
         }
 
@@ -222,17 +224,17 @@ class MamboVoiceListener(
     }
 
     private fun handleCommandSegment(recognizer: LocalVoskSpeechRecognizer, segment: VoiceSegment) {
-        val text = recognizer.transcribeCommand(segment.pcmBytes)
-        val command = (extractWakeCommand(text) ?: compactSpeechText(text))
-            .trimStart('，', ',', '。', '.', ' ', '：', ':')
-            .trim()
+        postDebug("送入命令识别：duration=${segment.durationMs}ms，vad=${segment.vadConfidence.formatScore()}")
+        val text = recognizer.transcribeCommandGrammar(segment.pcmBytes)
+        postCommandCandidate(text)
+        val command = normalizeCommandText(text)
 
         stage = Stage.WAKE
         commandDeadlineElapsedMs = 0L
         publishState(MamboVoiceState.WAITING_WAKE)
 
         if (command.isBlank()) {
-            postError("没有听清指令，请再叫曼波重试")
+            postError("没有听清指令，可以说：自检、读电量、停车。")
         } else {
             postCommand(command)
         }
@@ -258,36 +260,69 @@ class MamboVoiceListener(
         mainHandler.post { onErrorMessage(message) }
     }
 
-    private fun containsWakeWord(text: String): Boolean {
-        val compact = compactSpeechText(text)
-        return WAKE_WORDS.any { compact.contains(it) }
+    private fun postDebug(message: String) {
+        mainHandler.post { onDebugMessage(message) }
     }
 
-    private fun extractWakeCommand(text: String): String? {
+    private fun postWakeCandidate(result: WakeDetectionResult) {
+        val compact = compactSpeechText(result.normalizedText)
+        if (compact.isBlank()) {
+            postDebugThrottled("检测到语音段，但本地模型未识别出文字")
+            return
+        }
+        postDebug(
+            "唤醒候选：$compact，score=${result.wakeScore.formatScore()}，目标=${result.phrase}",
+        )
+    }
+
+    private fun postCommandCandidate(text: String) {
         val compact = compactSpeechText(text)
-        val match = WAKE_WORDS
-            .mapNotNull { wake ->
-                val index = compact.indexOf(wake)
-                if (index >= 0) index to wake.length else null
-            }
-            .minByOrNull { it.first }
-            ?: return null
-        return compact
-            .substring(match.first + match.second)
-            .trimStart('，', ',', '。', '.', ' ', '：', ':')
-            .trim()
+        if (compact.isBlank()) {
+            postDebug("命令候选：未识别")
+            return
+        }
+        postDebug("命令候选：$compact")
+    }
+
+    private fun postDebugThrottled(message: String) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastDebugElapsedMs < DEBUG_THROTTLE_MS) {
+            return
+        }
+        lastDebugElapsedMs = now
+        postDebug(message)
+    }
+
+    private fun normalizeCommandText(text: String): String {
+        val compact = compactSpeechText(text)
+        if (compact.isBlank() || compact == "unk") {
+            return ""
+        }
+        return COMMAND_ALIASES[compact] ?: compact
     }
 
     private fun compactSpeechText(text: String): String =
-        text.lowercase(Locale.ROOT).replace(Regex("\\s+"), "").trim()
+        text
+            .lowercase(Locale.ROOT)
+            .replace(Regex("\\[unk\\]"), "unk")
+            .replace(Regex("[\\s，,。.:：！？!?、]+"), "")
+            .trim()
+
+    private fun Double.formatScore(): String = String.format(Locale.US, "%.2f", this)
 
     private companion object {
         const val FRAME_MS = 32
         const val FRAME_SAMPLES = LocalVoskSpeechRecognizer.SAMPLE_RATE * FRAME_MS / 1_000
         const val FRAME_BYTES = FRAME_SAMPLES * 2
-        const val MIN_SEGMENT_MS = 420L
-        const val MAX_SEGMENT_MS = 7_000
+        const val MAX_SEGMENT_MS = 5_000
         const val COMMAND_TIMEOUT_MS = 7_000L
-        val WAKE_WORDS = listOf("曼波", "漫波", "mambo")
+        const val DEBUG_THROTTLE_MS = 2_500L
+        val COMMAND_ALIASES = mapOf(
+            "停止" to "停车",
+            "读状态" to "读取状态",
+            "读一下状态" to "读取状态",
+            "读电量" to "读取状态",
+            "自我检查" to "自检",
+        )
     }
 }

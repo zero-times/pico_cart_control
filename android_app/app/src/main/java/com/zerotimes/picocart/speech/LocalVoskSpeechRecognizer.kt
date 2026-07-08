@@ -15,6 +15,8 @@ internal class LocalVoskSpeechRecognizer private constructor(
 
     fun transcribeCommand(pcmBytes: ByteArray): String = transcribe(pcmBytes, grammar = null)
 
+    fun transcribeCommandGrammar(pcmBytes: ByteArray): String = transcribe(pcmBytes, COMMAND_GRAMMAR)
+
     override fun close() {
         model.close()
     }
@@ -39,7 +41,14 @@ internal class LocalVoskSpeechRecognizer private constructor(
         const val SAMPLE_RATE = 16_000
         private const val MODEL_ASSET_NAME = "model-cn"
         private const val MODEL_CACHE_NAME = "model-cn"
-        private const val WAKE_GRAMMAR = "[\"曼波\", \"漫波\", \"mambo\", \"[unk]\"]"
+        private const val WAKE_GRAMMAR =
+            "[\"曼波\", \"漫步\", \"慢不\", \"兰博\", \"蓝波\", " +
+                "\"你好曼波\", \"你好漫步\", \"曼波小车\", \"曼波曼波\", \"[unk]\"]"
+        private const val COMMAND_GRAMMAR =
+            "[\"停车\", \"急停\", \"前进\", \"后退\", \"左转\", \"右转\", \"读电量\", " +
+                "\"读取状态\", \"读状态\", " +
+                "\"进入调试模式\", \"退出调试模式\", \"测试左轮\", \"测试右轮\", " +
+                "\"开始牵引\", \"停止牵引\", \"自检\", \"确认\", \"取消\", \"[unk]\"]"
 
         fun create(context: Context): Result<LocalVoskSpeechRecognizer> {
             val modelDir = runCatching { resolveModelDir(context.applicationContext) }

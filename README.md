@@ -484,6 +484,31 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 Android 12 及以上会请求 `BLUETOOTH_SCAN` 和 `BLUETOOTH_CONNECT`；Android 11 及以下会请求蓝牙扫描所需的位置权限。BLE 调试不需要网络；AI 助手页会使用 `INTERNET` 权限调用 DeepSeek API。
 语音唤醒会请求 `RECORD_AUDIO` 权限。
 
+### Android ADB 调试日志
+
+Android App 会持续把运行日志落盘到应用外部私有目录，不需要额外存储权限：
+
+```text
+/sdcard/Android/data/com.zerotimes.picocart/files/logs/mambo_voice_debug.log
+/sdcard/Android/data/com.zerotimes.picocart/files/logs/pico_cart_debug.log
+```
+
+语音唤醒、VAD、STT、唤醒候选、命令候选、曼波朗读等链路优先看：
+
+```bash
+adb pull /sdcard/Android/data/com.zerotimes.picocart/files/logs/mambo_voice_debug.log .
+adb shell tail -n 120 /sdcard/Android/data/com.zerotimes.picocart/files/logs/mambo_voice_debug.log
+```
+
+如果要关联 BLE、Agent、工具调用和普通 App 日志：
+
+```bash
+adb pull /sdcard/Android/data/com.zerotimes.picocart/files/logs/pico_cart_debug.log .
+adb shell tail -n 120 /sdcard/Android/data/com.zerotimes.picocart/files/logs/pico_cart_debug.log
+```
+
+每个日志文件超过约 `2MB` 会自动轮转，保留 `.1`、`.2`、`.3` 三份历史文件。
+
 ## Android Agent Host V1
 
 最新设计指导见：
@@ -501,7 +526,7 @@ ANDROID_DEEPSEEK_TOOL_CALL_AGENT_GUIDE.md
 5. `AgentRuntime`：执行 tool-call 循环，保存工具日志，把 tool result 发回 DeepSeek。
 6. `CartHardware` BLE 适配：把工具调用转换为现有 Pico 行协议，例如 `status`、`stop`、`manual`、`auto`、`f/b/l/r <power>`。
 7. Compose UI：底部入口分为 `调试` 和 `助手`，助手页可填写 DeepSeek API Key、查看对话/工具日志，并手动解锁移动工具。
-8. 曼波语音链路：助手角色名为“曼波”；打开 `曼波唤醒` 后，App 使用 `AudioRecord` 常驻采样、本地 VAD 切段、本地 Vosk STT 识别唤醒词和指令。说出“曼波”后进入 `听指令`，把后面一段语音转文字发送给 DeepSeek；如果同一句已经包含命令，也会直接执行。
+8. 曼波语音链路：助手角色名为“曼波”；打开 `曼波唤醒` 后，App 使用 `AudioRecord` 常驻采样、本地 VAD 切段、本地 Vosk grammar 识别唤醒词和短命令。说出“你好曼波”或“曼波小车”后进入 `听指令`，再把后面一段短命令转文字发送给 DeepSeek；`停车`、`急停`、`取消` 会本地直接执行。
 9. 曼波朗读协议：DeepSeek 最终响应中的 `<mambo_say>...</mambo_say>` 会被 App 提取并朗读；普通响应仍显示在对话里并照常执行工具调用。
 
 安全边界：
@@ -527,11 +552,21 @@ cd android_app
 ```
 
 4. 打开 `曼波唤醒`，授予录音权限。
-5. 可以直接说：`曼波，读取状态`、`曼波，进入调试模式`、`曼波，低速前进两百毫秒`。
-6. 也可以先说 `曼波`，等状态变成 `听指令` 后再说：`读取状态`、`进入调试模式`。
+5. 先说 `你好曼波` 或 `曼波小车`，等状态变成 `听指令`。
+6. 再说短命令：`读取状态`、`自检`、`进入调试模式`、`停车`、`急停`。
 7. App 会显示识别到的文本、工具执行日志和普通响应，并朗读 `mambo_say` 片段。
 
+唤醒成功后，App 会在当前页面上层弹出曼波语音动画；动画下方显示当前听到/识别到的文案。命令语音结束后，识别文本会自动进入本地命令执行或发送给 DeepSeek API。
+
 当前语音唤醒是 App 内监听，不是系统级后台热词。需要 App 运行且 `曼波唤醒` 开关打开。语音链路不再调用 Android `SpeechRecognizer`，因此不会触发系统识别服务的开始/结束提示音；如果没有安装 `model-cn`，助手页会提示“未安装本地语音模型”并保持关闭。
+
+如果一直停在 `待唤醒`，看助手日志里的诊断：
+
+1. 出现 `VAD CALIBRATING`：启动后正在采集 2 秒底噪。
+2. 出现 `VAD POSSIBLE_SPEECH` / `VAD SPEECH_STARTED`：说明连续语音能量超过动态阈值。
+3. 出现 `VAD REJECTED_NOISE`：说明片段太短或能量不足，已丢弃并冷却 1 秒。
+4. 出现 `唤醒候选：...，score=...`：说明本地 STT 已识别出文本，App 会按文本、拼音和 VAD 置信度计算 wake_score。
+5. 没有任何诊断：检查系统是否把麦克风权限授给 App，或是否有其他应用占用麦克风。
 
 ## NekoSpeak 文字转语音模块
 

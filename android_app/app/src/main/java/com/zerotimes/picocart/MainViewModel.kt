@@ -18,6 +18,7 @@ import com.zerotimes.picocart.ble.BleChannel
 import com.zerotimes.picocart.ble.BleDeviceItem
 import com.zerotimes.picocart.ble.BleEvent
 import com.zerotimes.picocart.ble.PicoBleClient
+import com.zerotimes.picocart.logging.PersistentDebugLogStore
 import com.zerotimes.picocart.protocol.PicoProtocol
 import com.zerotimes.picocart.speech.MamboVoiceState
 import kotlinx.coroutines.Job
@@ -73,6 +74,9 @@ data class CartUiState(
     val mamboListening: Boolean = false,
     val mamboVoiceStatus: String = "关闭",
     val mamboLastTranscript: String = "",
+    val mamboOverlayVisible: Boolean = false,
+    val mamboOverlayCaption: String = "",
+    val mamboOverlayStatus: String = "",
     val mamboSpeechText: String = "",
     val mamboSpeechId: Long = 0L,
 ) {
@@ -102,6 +106,7 @@ private fun Map<String, String>.orEmptyValue(key: String): String = this[key].or
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val prefs = application.getSharedPreferences("agent_host", Context.MODE_PRIVATE)
+    private val persistentLogs = PersistentDebugLogStore(application)
     private val sessionStore = SessionStore(application)
     private val agentSessionId = prefs.getString(PREF_SESSION_ID, null)
         ?: sessionStore.createSession("车载助手").also { sessionId ->
@@ -172,8 +177,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val deviceMap = linkedMapOf<String, BleDeviceItem>()
     private val fullLogs = mutableListOf<LogEntry>()
     private var driveJob: Job? = null
+    private var mamboOverlayHideJob: Job? = null
     private var lastLogFile: File? = null
     private var identifyAfterConnected = false
+
+    init {
+        persistentLogs.appendApp("session_start package=${application.packageName} app_log=${persistentLogs.appLogPath}")
+        persistentLogs.appendVoice("session_start package=${application.packageName} voice_log=${persistentLogs.voiceLogPath}")
+        addLog("persistent logs app=${persistentLogs.appLogPath} voice=${persistentLogs.voiceLogPath}")
+    }
 
     fun requiredBlePermissions(): Array<String> = client.requiredPermissions()
     fun hasBlePermissions(): Boolean = client.hasBlePermissions()
@@ -315,11 +327,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun setMamboWakeEnabled(enabled: Boolean) {
+        persistentLogs.appendVoice("wake_enabled=$enabled")
+        if (!enabled) {
+            mamboOverlayHideJob?.cancel()
+        }
         _uiState.update {
             it.copy(
                 mamboWakeEnabled = enabled,
                 mamboListening = if (enabled) it.mamboListening else false,
                 mamboVoiceStatus = if (enabled) "启动中" else "关闭",
+                mamboOverlayVisible = if (enabled) it.mamboOverlayVisible else false,
+                mamboOverlayCaption = if (enabled) it.mamboOverlayCaption else "",
+                mamboOverlayStatus = if (enabled) it.mamboOverlayStatus else "",
             )
         }
         appendAgentMessage(
@@ -336,19 +355,56 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             MamboVoiceState.WAITING_WAKE -> "待唤醒"
             MamboVoiceState.LISTENING_COMMAND -> "听指令"
         }
+        persistentLogs.appendVoice("state=$state status=$status")
+        if (state == MamboVoiceState.LISTENING_COMMAND) {
+            mamboOverlayHideJob?.cancel()
+        }
         _uiState.update {
             it.copy(
                 mamboListening = state != MamboVoiceState.OFF,
                 mamboVoiceStatus = status,
+                mamboOverlayVisible = when (state) {
+                    MamboVoiceState.LISTENING_COMMAND -> true
+                    MamboVoiceState.OFF -> false
+                    else -> it.mamboOverlayVisible
+                },
+                mamboOverlayStatus = when (state) {
+                    MamboVoiceState.LISTENING_COMMAND -> "听指令"
+                    MamboVoiceState.OFF -> ""
+                    else -> it.mamboOverlayStatus
+                },
+                mamboOverlayCaption = when {
+                    state == MamboVoiceState.LISTENING_COMMAND && it.mamboOverlayCaption.isBlank() -> "我在"
+                    state == MamboVoiceState.OFF -> ""
+                    else -> it.mamboOverlayCaption
+                },
             )
         }
     }
 
     fun onMamboVoiceError(message: String) {
+        persistentLogs.appendVoice("error=$message")
+        showMamboOverlay(status = "未听清", caption = message, autoHide = true)
         appendAgentMessage(role = "tool", text = "曼波语音：$message", ok = false)
     }
 
+    fun onMamboVoiceDebug(message: String) {
+        persistentLogs.appendVoice(message)
+        if (message.startsWith("命令候选：")) {
+            val candidate = message.removePrefix("命令候选：").trim()
+            showMamboOverlay(
+                status = "识别中",
+                caption = candidate.takeUnless { it == "未识别" }.orEmpty(),
+                autoHide = false,
+            )
+        }
+        _uiState.update { it.copy(mamboLastTranscript = message) }
+        appendAgentMessage(role = "tool", text = "曼波语音：$message", ok = null)
+    }
+
     fun onMamboWake() {
+        persistentLogs.appendVoice("wake_matched")
+        showMamboOverlay(status = "听指令", caption = "我在")
         _uiState.update { it.copy(mamboLastTranscript = "曼波") }
         appendAgentMessage(role = "tool", text = "曼波已唤醒，开始听指令。", ok = true)
     }
@@ -358,7 +414,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (cleanCommand.isEmpty()) {
             return
         }
-        _uiState.update { it.copy(mamboLastTranscript = cleanCommand) }
+        persistentLogs.appendVoice("command=$cleanCommand")
+        _uiState.update {
+            it.copy(
+                mamboLastTranscript = cleanCommand,
+                mamboOverlayVisible = true,
+                mamboOverlayStatus = "正在执行",
+                mamboOverlayCaption = cleanCommand,
+            )
+        }
+        scheduleMamboOverlayHide()
+        if (cleanCommand in LOCAL_STOP_COMMANDS) {
+            appendAgentMessage(role = "tool", text = "曼波本地执行：$cleanCommand", ok = true)
+            releaseDrive(sendStop = true)
+            emitMamboSpeech("已停车。")
+            return
+        }
         appendAgentMessage(role = "tool", text = "曼波指令：$cleanCommand", ok = true)
         startAgentTurn(cleanCommand, clearTypedInput = false)
     }
@@ -498,6 +569,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         releaseDrive(sendStop = false)
         client.close()
         sessionStore.close()
+        persistentLogs.appendApp("session_end")
+        persistentLogs.appendVoice("session_end")
+        persistentLogs.close()
         super.onCleared()
     }
 
@@ -579,6 +653,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun addLog(message: String) {
+        persistentLogs.appendApp(message)
         val entry = LogEntry(
             id = "log-${System.currentTimeMillis()}-${fullLogs.size}",
             text = "${timeFormat.format(Date())} $message",
@@ -601,6 +676,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun appendAgentMessage(role: String, text: String, ok: Boolean? = null) {
+        persistentLogs.appendAgent(role = role, message = text, ok = ok)
         val entry = AgentChatEntry(
             id = "agent-${System.currentTimeMillis()}-${text.hashCode()}",
             role = role,
@@ -613,11 +689,42 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun emitMamboSpeech(text: String) {
+        persistentLogs.appendVoice("speak=$text")
         _uiState.update {
             it.copy(
                 mamboSpeechText = text,
                 mamboSpeechId = System.currentTimeMillis(),
             )
+        }
+    }
+
+    private fun showMamboOverlay(status: String, caption: String, autoHide: Boolean = false) {
+        if (!autoHide) {
+            mamboOverlayHideJob?.cancel()
+        }
+        _uiState.update {
+            it.copy(
+                mamboOverlayVisible = true,
+                mamboOverlayStatus = status,
+                mamboOverlayCaption = caption.ifBlank { it.mamboOverlayCaption },
+            )
+        }
+        if (autoHide) {
+            scheduleMamboOverlayHide()
+        }
+    }
+
+    private fun scheduleMamboOverlayHide(delayMs: Long = 2_400L) {
+        mamboOverlayHideJob?.cancel()
+        mamboOverlayHideJob = viewModelScope.launch {
+            delay(delayMs)
+            _uiState.update {
+                it.copy(
+                    mamboOverlayVisible = false,
+                    mamboOverlayCaption = "",
+                    mamboOverlayStatus = "",
+                )
+            }
         }
     }
 
@@ -671,6 +778,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         const val PREF_SESSION_ID = "session_id"
         val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.US)
         val fileTimeFormat = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
+        val LOCAL_STOP_COMMANDS = setOf("停车", "急停", "取消")
         fun formatDateTime(date: Date): String =
             SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(date)
 
