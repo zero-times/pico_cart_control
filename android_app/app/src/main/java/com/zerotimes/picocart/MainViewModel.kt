@@ -407,6 +407,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         showMamboOverlay(status = "听指令", caption = "我在")
         _uiState.update { it.copy(mamboLastTranscript = "曼波") }
         appendAgentMessage(role = "tool", text = "曼波已唤醒，开始听指令。", ok = true)
+        emitMamboSpeech("我在")
     }
 
     fun onMamboCommand(command: String) {

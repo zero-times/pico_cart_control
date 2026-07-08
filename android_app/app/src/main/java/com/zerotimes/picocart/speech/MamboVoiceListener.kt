@@ -225,9 +225,11 @@ class MamboVoiceListener(
 
     private fun handleCommandSegment(recognizer: LocalVoskSpeechRecognizer, segment: VoiceSegment) {
         postDebug("送入命令识别：duration=${segment.durationMs}ms，vad=${segment.vadConfidence.formatScore()}")
-        val text = recognizer.transcribeCommandGrammar(segment.pcmBytes)
-        postCommandCandidate(text)
-        val command = normalizeCommandText(text)
+        val grammarText = recognizer.transcribeCommandGrammar(segment.pcmBytes)
+        val freeText = recognizer.transcribeCommand(segment.pcmBytes)
+        postDebug("命令识别明细：grammar=${grammarText.forLog()}，free=${freeText.forLog()}")
+        val command = chooseCommandText(grammarText = grammarText, freeText = freeText)
+        postCommandCandidate(command)
 
         stage = Stage.WAKE
         commandDeadlineElapsedMs = 0L
@@ -238,6 +240,18 @@ class MamboVoiceListener(
         } else {
             postCommand(command)
         }
+    }
+
+    private fun chooseCommandText(grammarText: String, freeText: String): String {
+        val grammarCommand = normalizeCommandText(grammarText)
+        val freeCommand = normalizeCommandText(freeText)
+        if (freeCommand.isBlank()) {
+            return grammarCommand
+        }
+        if (freeCommand in COMMAND_ALIASES.keys || freeCommand in CANONICAL_COMMANDS) {
+            return COMMAND_ALIASES[freeCommand] ?: freeCommand
+        }
+        return freeCommand
     }
 
     private fun publishState(next: MamboVoiceState) {
@@ -310,6 +324,9 @@ class MamboVoiceListener(
 
     private fun Double.formatScore(): String = String.format(Locale.US, "%.2f", this)
 
+    private fun String.forLog(): String =
+        compactSpeechText(this).ifBlank { "未识别" }
+
     private companion object {
         const val FRAME_MS = 32
         const val FRAME_SAMPLES = LocalVoskSpeechRecognizer.SAMPLE_RATE * FRAME_MS / 1_000
@@ -317,6 +334,24 @@ class MamboVoiceListener(
         const val MAX_SEGMENT_MS = 5_000
         const val COMMAND_TIMEOUT_MS = 7_000L
         const val DEBUG_THROTTLE_MS = 2_500L
+        val CANONICAL_COMMANDS = setOf(
+            "停车",
+            "急停",
+            "前进",
+            "后退",
+            "左转",
+            "右转",
+            "读取状态",
+            "进入调试模式",
+            "退出调试模式",
+            "测试左轮",
+            "测试右轮",
+            "开始牵引",
+            "停止牵引",
+            "自检",
+            "确认",
+            "取消",
+        )
         val COMMAND_ALIASES = mapOf(
             "停止" to "停车",
             "读状态" to "读取状态",

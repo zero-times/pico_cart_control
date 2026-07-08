@@ -568,6 +568,14 @@ cd android_app
 4. 出现 `唤醒候选：...，score=...`：说明本地 STT 已识别出文本，App 会按文本、拼音和 VAD 置信度计算 wake_score。
 5. 没有任何诊断：检查系统是否把麦克风权限授给 App，或是否有其他应用占用麦克风。
 
+曼波朗读优先使用内置 mp3 短句，当前本地缓存语音放在：
+
+```text
+android_app/app/src/main/assets/mambo_voice/
+```
+
+已内置 `我在`、`自检完成`、`已停车`、`干完了`。这些短句会直接播放 mp3；其他没有命中的文本继续回退到 Android 系统 TTS。
+
 ## NekoSpeak 文字转语音模块
 
 已从上游拉取 NekoSpeak 源码到：
