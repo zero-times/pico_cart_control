@@ -18,6 +18,7 @@ import com.zerotimes.picocart.ble.BleChannel
 import com.zerotimes.picocart.ble.BleDeviceItem
 import com.zerotimes.picocart.ble.BleEvent
 import com.zerotimes.picocart.ble.PicoBleClient
+import com.zerotimes.picocart.gamepad.GamepadState
 import com.zerotimes.picocart.logging.PersistentDebugLogStore
 import com.zerotimes.picocart.protocol.PicoProtocol
 import com.zerotimes.picocart.speech.MamboVoiceState
@@ -79,6 +80,7 @@ data class CartUiState(
     val mamboOverlayStatus: String = "",
     val mamboSpeechText: String = "",
     val mamboSpeechId: Long = 0L,
+    val gamepadState: GamepadState = GamepadState(),
 ) {
     val paramRows: List<Pair<String, String>>
         get() = PicoProtocol.paramKeys.map { it to paramInputs.orEmptyValue(it) }
@@ -313,6 +315,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         client.sendCommand(command)
     }
 
+    fun updateGamepadState(gamepadState: GamepadState) {
+        _uiState.update { it.copy(gamepadState = gamepadState) }
+    }
+
+    fun onGamepadDebugLog(message: String) {
+        addLog(message)
+    }
+
     fun updateAgentApiKey(value: String) {
         _uiState.update { it.copy(agentApiKey = value) }
         prefs.edit().putString(PREF_DEEPSEEK_API_KEY, value).apply()
@@ -510,6 +520,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             "",
             "[params]",
             state.paramInputs.toSortedMap().toString(),
+            "",
+            "[gamepad]",
+            state.gamepadState.toString(),
             "",
             "[logs]",
         )

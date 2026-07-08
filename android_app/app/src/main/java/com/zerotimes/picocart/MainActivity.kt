@@ -6,6 +6,8 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.view.KeyEvent
+import android.view.MotionEvent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -116,15 +118,21 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.zerotimes.picocart.ble.BleDeviceItem
+import com.zerotimes.picocart.gamepad.GamepadController
+import com.zerotimes.picocart.gamepad.GamepadInputReader
+import com.zerotimes.picocart.gamepad.GamepadState
 import com.zerotimes.picocart.speech.LocalCachedSpeechEngine
 import com.zerotimes.picocart.speech.MamboVoiceListener
 import com.zerotimes.picocart.speech.SpeechEngine
 import com.zerotimes.picocart.ui.PicoCartTheme
+import kotlinx.coroutines.delay
+import java.util.Locale
 import kotlin.math.min
 import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
     private lateinit var speechEngine: SpeechEngine
+    private var gamepadController: GamepadController? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
@@ -145,8 +153,36 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        gamepadController = null
         speechEngine.shutdown()
         super.onDestroy()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        gamepadController?.refreshConnectedDevices()
+    }
+
+    override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
+        if (GamepadInputReader.isGamepadSource(event.source) &&
+            gamepadController?.onMotionEvent(event) == true
+        ) {
+            return true
+        }
+        return super.dispatchGenericMotionEvent(event)
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (GamepadInputReader.isGamepadSource(event.source) &&
+            gamepadController?.onKeyEvent(event) == true
+        ) {
+            return true
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    fun bindGamepadController(controller: GamepadController?) {
+        gamepadController = controller
     }
 }
 
@@ -168,6 +204,12 @@ private fun PicoCartApp(
             onDebugMessage = viewModel::onMamboVoiceDebug,
         )
     }
+    val gamepadController = remember(viewModel) {
+        GamepadController(
+            onStateChanged = viewModel::updateGamepadState,
+            onLog = viewModel::onGamepadDebugLog,
+        )
+    }
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { result ->
@@ -187,6 +229,22 @@ private fun PicoCartApp(
 
     DisposableEffect(mamboVoiceListener) {
         onDispose { mamboVoiceListener.destroy() }
+    }
+
+    DisposableEffect(gamepadController) {
+        val activity = context as? MainActivity
+        activity?.bindGamepadController(gamepadController)
+        gamepadController.refreshConnectedDevices()
+        onDispose {
+            activity?.bindGamepadController(null)
+        }
+    }
+
+    LaunchedEffect(gamepadController) {
+        while (true) {
+            gamepadController.refreshConnectedDevices()
+            delay(1_000L)
+        }
     }
 
     LaunchedEffect(state.mamboWakeEnabled) {
@@ -429,6 +487,7 @@ private fun PicoCartScreen(
                                 onManual = onManual,
                             )
                         }
+                        item { GamepadDebugPanel(gamepad = state.gamepadState) }
                         item {
                             CommandLogSection(
                                 state = state,
@@ -466,6 +525,7 @@ private fun PicoCartScreen(
                     }
                     else -> {
                         item { DriveStatusStrip(state = state) }
+                        item { GamepadStatusCard(gamepad = state.gamepadState) }
                         if (!state.connected) {
                             item {
                                 Toolbar(
@@ -1081,6 +1141,167 @@ private fun RecentCommandSection(
 }
 
 @Composable
+private fun GamepadStatusCard(gamepad: GamepadState) {
+    Section(
+        title = "Xbox 手柄",
+        trailing = {
+            StatusPill(
+                label = "HID",
+                value = if (gamepad.connected) "已连接" else "未检测",
+                icon = if (gamepad.connected) Icons.Filled.CheckCircle else Icons.Filled.Warning,
+                tone = if (gamepad.connected) StatusTone.Normal else StatusTone.Muted,
+            )
+        },
+    ) {
+        Text(
+            if (gamepad.connected) {
+                gamepad.deviceName.orEmpty().ifBlank { "Gamepad #${gamepad.deviceId ?: "-"}" }
+            } else {
+                "未检测到 Xbox 手柄，请先在 Android 蓝牙设置中连接手柄。"
+            },
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Spacer(Modifier.height(10.dp))
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            StatusPill(
+                label = "控制源",
+                value = "调试输入",
+                icon = Icons.Filled.Bluetooth,
+                tone = StatusTone.Accent,
+            )
+            StatusPill(
+                label = "RB 使能",
+                value = if (gamepad.buttonRb) "按住" else "未按",
+                icon = if (gamepad.buttonRb) Icons.Filled.CheckCircle else Icons.Filled.Warning,
+                tone = if (gamepad.buttonRb) StatusTone.Normal else StatusTone.Muted,
+            )
+            StatusPill(
+                label = "B 停车",
+                value = if (gamepad.buttonB) "按下" else "待命",
+                icon = Icons.Filled.Stop,
+                tone = if (gamepad.buttonB) StatusTone.Danger else StatusTone.Muted,
+            )
+        }
+        Spacer(Modifier.height(10.dp))
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                AxisCell("左摇杆 X", gamepad.axisX, Modifier.weight(1f))
+                AxisCell("左摇杆 Y", gamepad.axisY, Modifier.weight(1f))
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                AxisCell("RT / RTRIGGER", gamepad.axisRightTrigger, Modifier.weight(1f))
+                AxisCell("LT / LTRIGGER", gamepad.axisLeftTrigger, Modifier.weight(1f))
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "第一阶段只显示输入，不向 Pico 发送手柄驾驶命令。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
+private fun GamepadDebugPanel(gamepad: GamepadState) {
+    Section(
+        title = "Gamepad Debug",
+        trailing = {
+            Text(
+                if (gamepad.connected) "device=${gamepad.deviceId ?: "-"}" else "未检测到",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontFamily = FontFamily.Monospace,
+            )
+        },
+    ) {
+        Text(
+            gamepad.lastEvent,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Spacer(Modifier.height(10.dp))
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            gamepad.axisRows.chunked(2).forEach { row ->
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    row.forEach { (label, value) ->
+                        AxisCell(label, value, Modifier.weight(1f))
+                    }
+                    if (row.size == 1) {
+                        Spacer(Modifier.weight(1f))
+                    }
+                }
+            }
+        }
+        Spacer(Modifier.height(12.dp))
+        Text("Buttons", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(8.dp))
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            gamepad.buttonRows.forEach { (label, pressed) ->
+                FilterChip(
+                    selected = pressed,
+                    onClick = {},
+                    label = { Text(label, fontFamily = FontFamily.Monospace) },
+                    leadingIcon = if (pressed) {
+                        {
+                            Icon(
+                                Icons.Filled.CheckCircle,
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp),
+                            )
+                        }
+                    } else {
+                        null
+                    },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun AxisCell(label: String, value: Float, modifier: Modifier = Modifier) {
+    Surface(
+        modifier = modifier.height(74.dp),
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+    ) {
+        Column(
+            modifier = Modifier.padding(10.dp),
+            verticalArrangement = Arrangement.Center,
+        ) {
+            Text(
+                label,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontFamily = FontFamily.Monospace,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                value.formatAxis(),
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.Monospace,
+                maxLines = 1,
+            )
+        }
+    }
+}
+
+@Composable
 private fun VoiceCoreSection(state: CartUiState) {
     val normalized = state.mamboLastTranscript.normalizeMamboTranscript()
     val toolItems = state.agentMessages.filter { it.role == "tool" }.takeLast(5)
@@ -1286,6 +1507,7 @@ private fun StatusDashboardSection(
             HealthCardData("右轮", state.status.displayValue("pwmr", "0"), "sensor=${state.status.displayValue("r", "0")}", StatusTone.Accent),
             HealthCardData("DeepSeek", if (state.agentRunning) "思考中" else "就绪", if (state.agentApiKey.isBlank()) "未配置 API Key" else "API Key 已配置", if (state.agentApiKey.isBlank()) StatusTone.Warning else StatusTone.Normal),
             HealthCardData("语音", state.mamboVoiceStatus, if (state.mamboWakeEnabled) "唤醒开启" else "唤醒关闭", if (state.mamboWakeEnabled) StatusTone.Normal else StatusTone.Muted),
+            HealthCardData("手柄", if (state.gamepadState.connected) "已连接" else "未检测", state.gamepadState.deviceName ?: "Xbox HID", if (state.gamepadState.connected) StatusTone.Normal else StatusTone.Muted),
         )
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             cards.chunked(2).forEach { row ->
@@ -2152,6 +2374,10 @@ private fun Map<String, String>.displayValue(key: String, fallback: String): Str
 
 private fun Map<String, String>.isTruthy(key: String): Boolean {
     return this[key]?.lowercase() in setOf("1", "true", "yes", "on", "unsafe")
+}
+
+private fun Float.formatAxis(): String {
+    return String.format(Locale.US, "%.2f", this)
 }
 
 private fun String.normalizeMamboTranscript(): String {
