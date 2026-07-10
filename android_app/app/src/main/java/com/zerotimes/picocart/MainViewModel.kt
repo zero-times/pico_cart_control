@@ -6,6 +6,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.os.Environment
+import android.os.SystemClock
 import androidx.core.content.FileProvider
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -28,6 +29,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.File
 import java.text.SimpleDateFormat
@@ -51,6 +53,8 @@ data class CartUiState(
     val scanning: Boolean = false,
     val connected: Boolean = false,
     val connecting: Boolean = false,
+    val picoHeartbeatOk: Boolean = false,
+    val picoHeartbeatStatus: String = "Pico 未连接",
     val deviceId: String = "",
     val deviceName: String = "",
     val serviceId: String = "",
@@ -82,6 +86,9 @@ data class CartUiState(
     val mamboSpeechId: Long = 0L,
     val gamepadState: GamepadState = GamepadState(),
 ) {
+    val cartReady: Boolean
+        get() = connected && picoHeartbeatOk
+
     val paramRows: List<Pair<String, String>>
         get() = PicoProtocol.paramKeys.map { it to paramInputs.orEmptyValue(it) }
 
@@ -132,14 +139,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val agentRuntime = AgentRuntime(
         store = sessionStore,
         hardware = object : CartHardware {
+            override fun connectionError(): String? = cartConnectionError()
+
+            override fun lastOperationError(): String? = lastHardwareOperationError
+
             override suspend fun getStatus(): CartStatus? {
-                if (!sendCommandForAgent("status")) return currentCartStatus()
-                delay(250)
-                return currentCartStatus()
+                return requestFreshStatusForAgent()
             }
 
-            override suspend fun stop() {
-                sendCommandForAgent("stop")
+            override suspend fun stop(): Boolean {
+                return sendCommandForAgent("stop")
             }
 
             override suspend fun setMode(mode: String): Boolean {
@@ -159,8 +168,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 if (!sendCommandForAgent(command)) return false
                 delay(durationMs.toLong())
-                sendCommandForAgent("stop")
-                return true
+                return sendCommandForAgent("stop")
             }
 
             override suspend fun turn(direction: String, speedLevel: Int, durationMs: Int): Boolean {
@@ -171,17 +179,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 if (!sendCommandForAgent(command)) return false
                 delay(durationMs.toLong())
-                sendCommandForAgent("stop")
-                return true
+                return sendCommandForAgent("stop")
             }
         },
     )
     private val deviceMap = linkedMapOf<String, BleDeviceItem>()
     private val fullLogs = mutableListOf<LogEntry>()
     private var driveJob: Job? = null
+    private var heartbeatJob: Job? = null
     private var mamboOverlayHideJob: Job? = null
     private var lastLogFile: File? = null
     private var identifyAfterConnected = false
+    @Volatile private var lastHeartbeatElapsedMs = 0L
+    @Volatile private var heartbeatMonitorStartedElapsedMs = 0L
+    @Volatile private var lastHardwareOperationError: String? = null
 
     init {
         persistentLogs.appendApp("session_start package=${application.packageName} app_log=${persistentLogs.appLogPath}")
@@ -229,12 +240,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun disconnect() {
         releaseDrive(sendStop = false)
+        heartbeatJob?.cancel()
+        lastHeartbeatElapsedMs = 0L
+        heartbeatMonitorStartedElapsedMs = 0L
         client.disconnect()
         _uiState.update {
             it.copy(
                 connected = false,
                 streaming = false,
                 connecting = false,
+                picoHeartbeatOk = false,
+                picoHeartbeatStatus = "Pico 未连接",
                 deviceId = "",
                 deviceName = "",
                 serviceId = "",
@@ -255,8 +271,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun toggleStream() {
         val next = !_uiState.value.streaming
-        _uiState.update { it.copy(streaming = next) }
-        sendCommand(if (next) "stream on" else "stream off")
+        if (sendCommand(if (next) "stream on" else "stream off")) {
+            _uiState.update { it.copy(streaming = next) }
+        }
     }
 
     fun onPowerChange(value: Float) {
@@ -266,11 +283,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun holdDrive(direction: String) {
         val command = directionCommand(direction)
         releaseDrive(sendStop = false)
-        sendCommand(command)
+        if (!sendCommand(command)) return
         driveJob = viewModelScope.launch {
-            while (true) {
+            while (isActive && sendCommand(command)) {
                 delay(260)
-                sendCommand(command)
             }
         }
     }
@@ -307,12 +323,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun sendCommand(command: String) {
-        if (!_uiState.value.connected) {
-            addLog("not connected")
-            return
+    fun sendCommand(command: String): Boolean {
+        val error = cartConnectionError()
+        if (error != null) {
+            lastHardwareOperationError = error
+            addLog("command blocked: $error")
+            return false
         }
         client.sendCommand(command)
+        return true
     }
 
     fun updateGamepadState(gamepadState: GamepadState) {
@@ -472,6 +491,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     userText = userText,
                     apiKey = snapshot.agentApiKey,
                     cartStatus = currentCartStatus(),
+                    cartConnectionError = cartConnectionError(),
                     movementUnlocked = snapshot.agentMovementUnlocked,
                     onEvent = ::handleAgentEvent,
                 )
@@ -581,6 +601,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         releaseDrive(sendStop = false)
+        heartbeatJob?.cancel()
         client.close()
         sessionStore.close()
         persistentLogs.appendApp("session_end")
@@ -601,8 +622,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             is BleEvent.Connected -> handleConnected(event.device, event.channel)
             BleEvent.Disconnected -> {
                 releaseDrive(sendStop = false)
+                heartbeatJob?.cancel()
+                lastHeartbeatElapsedMs = 0L
+                heartbeatMonitorStartedElapsedMs = 0L
                 _uiState.update {
-                    it.copy(connected = false, connecting = false, streaming = false)
+                    it.copy(
+                        connected = false,
+                        connecting = false,
+                        streaming = false,
+                        picoHeartbeatOk = false,
+                        picoHeartbeatStatus = "Pico 未连接",
+                    )
                 }
             }
             is BleEvent.LineReceived -> applyLine(event.line)
@@ -619,6 +649,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             it.copy(
                 connected = true,
                 connecting = false,
+                picoHeartbeatOk = false,
+                picoHeartbeatStatus = "等待 Pico 心跳",
                 deviceId = device.address,
                 deviceName = device.name,
                 serviceId = channel.serviceId,
@@ -627,11 +659,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 writeNoResponse = channel.writeNoResponse,
             )
         }
+        lastHeartbeatElapsedMs = 0L
+        heartbeatMonitorStartedElapsedMs = SystemClock.elapsedRealtime()
+        startHeartbeatMonitor()
         viewModelScope.launch {
             delay(180)
-            sendCommand("status")
+            requestHeartbeat()
             delay(120)
-            sendCommand("param")
+            client.sendCommand("param")
             if (identifyAfterConnected) {
                 delay(200)
                 identifyAfterConnected = false
@@ -641,11 +676,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun applyLine(line: String) {
-        addLog("< $line")
         val parsed = PicoProtocol.parseLine(line)
+        if (parsed.type != "stat") {
+            addLog("< $line")
+        }
         when (parsed.type) {
-            "stat" -> _uiState.update { state ->
-                state.copy(status = state.status + parsed.fields + ("type" to parsed.type))
+            "stat" -> {
+                recordHeartbeat()
+                _uiState.update { state ->
+                    state.copy(status = state.status + parsed.fields + ("type" to parsed.type))
+                }
             }
             "param" -> _uiState.update { state ->
                 val updatedInputs = state.paramInputs.toMutableMap()
@@ -743,12 +783,88 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun sendCommandForAgent(command: String): Boolean {
-        if (!_uiState.value.connected) {
-            addLog("agent not connected")
-            return false
+        return sendCommand(command)
+    }
+
+    private suspend fun requestFreshStatusForAgent(): CartStatus? {
+        val heartbeatBeforeRequest = lastHeartbeatElapsedMs
+        if (!sendCommandForAgent("status")) return null
+        delay(HEARTBEAT_RESPONSE_TIMEOUT_MS)
+        val hasFreshResponse = lastHeartbeatElapsedMs > heartbeatBeforeRequest && heartbeatIsFresh()
+        if (!hasFreshResponse) {
+            lastHardwareOperationError = "Pico 状态响应超时，请检查 Pico 供电、BLE 串口或距离。"
+            addLog("agent status timeout")
+            return null
         }
-        client.sendCommand(command)
-        return true
+        return currentCartStatus()
+    }
+
+    private fun startHeartbeatMonitor() {
+        heartbeatJob?.cancel()
+        heartbeatJob = viewModelScope.launch {
+            while (isActive && _uiState.value.connected) {
+                requestHeartbeat()
+                delay(HEARTBEAT_INTERVAL_MS)
+                refreshHeartbeatHealth()
+            }
+        }
+    }
+
+    private fun requestHeartbeat() {
+        if (_uiState.value.connected) {
+            client.sendCommand("status", logCommand = false)
+        }
+    }
+
+    private fun recordHeartbeat() {
+        lastHeartbeatElapsedMs = SystemClock.elapsedRealtime()
+        lastHardwareOperationError = null
+        _uiState.update {
+            it.copy(
+                picoHeartbeatOk = true,
+                picoHeartbeatStatus = "心跳正常",
+            )
+        }
+    }
+
+    private fun refreshHeartbeatHealth() {
+        val state = _uiState.value
+        if (!state.connected || !heartbeatHasTimedOut()) return
+        val status = "Pico 心跳超时"
+        if (state.picoHeartbeatOk || state.picoHeartbeatStatus != status) {
+            releaseDrive(sendStop = false)
+            _uiState.update {
+                it.copy(
+                    picoHeartbeatOk = false,
+                    picoHeartbeatStatus = status,
+                    streaming = false,
+                )
+            }
+            addLog("pico heartbeat unavailable: $status")
+        }
+    }
+
+    private fun heartbeatIsFresh(): Boolean {
+        return lastHeartbeatElapsedMs != 0L &&
+            SystemClock.elapsedRealtime() - lastHeartbeatElapsedMs <= HEARTBEAT_TIMEOUT_MS
+    }
+
+    private fun heartbeatHasTimedOut(): Boolean {
+        val referenceTime = lastHeartbeatElapsedMs.takeIf { it != 0L }
+            ?: heartbeatMonitorStartedElapsedMs
+        return referenceTime != 0L &&
+            SystemClock.elapsedRealtime() - referenceTime > HEARTBEAT_TIMEOUT_MS
+    }
+
+    private fun cartConnectionError(): String? {
+        val state = _uiState.value
+        return when {
+            !state.connected -> "Pico 未连接：BLE 通道尚未建立。"
+            state.picoHeartbeatOk -> null
+            state.picoHeartbeatStatus == "Pico 心跳超时" ->
+                "Pico 心跳超时：已阻止命令发送，请检查供电、串口和蓝牙距离。"
+            else -> "Pico 心跳未就绪：已阻止命令发送，正在等待 status 响应。"
+        }
     }
 
     private fun currentCartStatus(): CartStatus {
@@ -790,6 +906,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private companion object {
         const val PREF_DEEPSEEK_API_KEY = "deepseek_api_key"
         const val PREF_SESSION_ID = "session_id"
+        const val HEARTBEAT_INTERVAL_MS = 2_000L
+        const val HEARTBEAT_TIMEOUT_MS = 4_500L
+        const val HEARTBEAT_RESPONSE_TIMEOUT_MS = 900L
         val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.US)
         val fileTimeFormat = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
         val LOCAL_STOP_COMMANDS = setOf("停车", "急停", "取消")

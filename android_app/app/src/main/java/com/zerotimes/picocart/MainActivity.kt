@@ -9,10 +9,6 @@ import android.os.Bundle
 import android.view.KeyEvent
 import android.view.MotionEvent
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -25,7 +21,6 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -34,6 +29,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -46,6 +42,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -71,7 +68,6 @@ import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ElevatedButton
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
@@ -79,9 +75,11 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -104,8 +102,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
@@ -127,7 +123,6 @@ import com.zerotimes.picocart.speech.SpeechEngine
 import com.zerotimes.picocart.ui.PicoCartTheme
 import kotlinx.coroutines.delay
 import java.util.Locale
-import kotlin.math.min
 import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
@@ -319,6 +314,9 @@ private fun estimateSpeechDurationMs(text: String): Long {
     return (charCount * 240L + 1_200L).coerceIn(2_000L, 12_000L)
 }
 
+private val NeoShape = RoundedCornerShape(6.dp)
+private val NeoSoftShape = RoundedCornerShape(8.dp)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun PicoCartScreen(
@@ -369,8 +367,11 @@ private fun PicoCartScreen(
                                     "status" -> "健康状态"
                                     "debug" -> "工程调试"
                                     "settings" -> "设置"
-                                    else -> "赛博驾驶舱"
+                                    else -> "小车驾驶"
                                 },
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.Bold,
+                                fontFamily = FontFamily.Monospace,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                             )
@@ -384,50 +385,72 @@ private fun PicoCartScreen(
                         }
                     },
                     actions = {
+                        StatusBadge(connected = state.connected, heartbeatOk = state.picoHeartbeatOk)
                         IconButton(
                             onClick = onStop,
-                            enabled = state.connected,
+                            enabled = state.cartReady,
+                            colors = IconButtonDefaults.iconButtonColors(
+                                containerColor = MaterialTheme.colorScheme.errorContainer,
+                                contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                                disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant,
+                                disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                            ),
                         ) {
                             Icon(Icons.Filled.Stop, contentDescription = "急停")
                         }
-                        StatusBadge(connected = state.connected)
                     },
                     colors = TopAppBarDefaults.topAppBarColors(
-                        containerColor = MaterialTheme.colorScheme.surface,
+                        containerColor = MaterialTheme.colorScheme.background,
+                        titleContentColor = MaterialTheme.colorScheme.onBackground,
                     ),
                 )
             },
             bottomBar = {
-                NavigationBar {
+                val navColors = NavigationBarItemDefaults.colors(
+                    selectedIconColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                    selectedTextColor = MaterialTheme.colorScheme.primary,
+                    indicatorColor = MaterialTheme.colorScheme.primaryContainer,
+                    unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                    unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                NavigationBar(
+                    containerColor = MaterialTheme.colorScheme.surface,
+                    tonalElevation = 0.dp,
+                ) {
                     NavigationBarItem(
                         selected = selectedTab == "drive",
                         onClick = { onSelectTab("drive") },
                         icon = { Icon(Icons.Filled.PlayArrow, contentDescription = null) },
                         label = { Text("驾驶") },
+                        colors = navColors,
                     )
                     NavigationBarItem(
                         selected = selectedTab == "voice",
                         onClick = { onSelectTab("voice") },
                         icon = { Icon(Icons.AutoMirrored.Filled.VolumeUp, contentDescription = null) },
                         label = { Text("语音") },
+                        colors = navColors,
                     )
                     NavigationBarItem(
                         selected = selectedTab == "status",
                         onClick = { onSelectTab("status") },
                         icon = { Icon(Icons.Filled.CheckCircle, contentDescription = null) },
                         label = { Text("状态") },
+                        colors = navColors,
                     )
                     NavigationBarItem(
                         selected = selectedTab == "debug",
                         onClick = { onSelectTab("debug") },
                         icon = { Icon(Icons.Filled.Warning, contentDescription = null) },
                         label = { Text("调试") },
+                        colors = navColors,
                     )
                     NavigationBarItem(
                         selected = selectedTab == "settings",
                         onClick = { onSelectTab("settings") },
                         icon = { Icon(Icons.Filled.Settings, contentDescription = null) },
                         label = { Text("设置") },
+                        colors = navColors,
                     )
                 }
             },
@@ -435,11 +458,15 @@ private fun PicoCartScreen(
             LazyColumn(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(MaterialTheme.colorScheme.surface)
+                    .background(MaterialTheme.colorScheme.background)
                     .padding(innerPadding)
-                    .padding(horizontal = 16.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
+                    .padding(horizontal = 12.dp),
+                contentPadding = PaddingValues(vertical = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
+                if (!state.cartReady) {
+                    item { PicoConnectionAlert(state) }
+                }
                 when (selectedTab) {
                     "voice" -> {
                         item { VoiceCoreSection(state = state) }
@@ -525,7 +552,6 @@ private fun PicoCartScreen(
                     }
                     else -> {
                         item { DriveStatusStrip(state = state) }
-                        item { GamepadStatusCard(gamepad = state.gamepadState) }
                         if (!state.connected) {
                             item {
                                 Toolbar(
@@ -545,23 +571,23 @@ private fun PicoCartScreen(
                                 )
                             }
                         } else {
-                        item {
-                            DriveCockpitSection(
-                                state = state,
-                                onStop = onStop,
-                                onPowerChange = onPowerChange,
-                                onDrivePress = onDrivePress,
-                                onDriveRelease = onDriveRelease,
-                            )
-                        }
-                        item {
-                            RecentCommandSection(
-                                state = state,
-                                onStatus = onStatus,
-                                onManual = onManual,
-                                onAuto = onAuto,
-                            )
-                        }
+                            item {
+                                DriveCockpitSection(
+                                    state = state,
+                                    onStop = onStop,
+                                    onPowerChange = onPowerChange,
+                                    onDrivePress = onDrivePress,
+                                    onDriveRelease = onDriveRelease,
+                                )
+                            }
+                            item {
+                                RecentCommandSection(
+                                    state = state,
+                                    onStatus = onStatus,
+                                    onManual = onManual,
+                                    onAuto = onAuto,
+                                )
+                            }
                         }
                     }
                 }
@@ -598,7 +624,7 @@ private fun MamboVoiceOverlay(state: CartUiState) {
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(top = 88.dp),
-                shape = RoundedCornerShape(8.dp),
+                shape = NeoSoftShape,
                 color = MaterialTheme.colorScheme.surface,
                 contentColor = MaterialTheme.colorScheme.onSurface,
                 tonalElevation = 6.dp,
@@ -644,55 +670,32 @@ private fun MamboVoiceOrb(
     modifier: Modifier = Modifier,
 ) {
     val colors = MaterialTheme.colorScheme
-    val transition = rememberInfiniteTransition(label = "mambo-voice-orb")
-    val pulse by transition.animateFloat(
-        initialValue = if (active) 0.92f else 0.98f,
-        targetValue = if (active) 1.12f else 1.04f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(if (active) 820 else 1_400),
-            repeatMode = RepeatMode.Reverse,
-        ),
-        label = "pulse",
-    )
-    val drift by transition.animateFloat(
-        initialValue = -1f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(if (active) 1_200 else 1_900),
-            repeatMode = RepeatMode.Reverse,
-        ),
-        label = "drift",
-    )
-
-    Canvas(modifier = modifier) {
-        val diameter = min(size.width, size.height)
-        val center = Offset(size.width / 2f, size.height / 2f)
-        val baseRadius = diameter * 0.34f
-        drawCircle(
-            color = colors.primary.copy(alpha = 0.18f),
-            radius = diameter * 0.48f * pulse,
-            center = center,
-        )
-        drawCircle(
-            color = colors.tertiary.copy(alpha = 0.34f),
-            radius = baseRadius * (1.05f + drift * 0.04f),
-            center = center + Offset(diameter * 0.08f * drift, -diameter * 0.05f),
-        )
-        drawCircle(
-            color = colors.secondary.copy(alpha = 0.30f),
-            radius = baseRadius * (0.92f - drift * 0.04f),
-            center = center + Offset(-diameter * 0.11f * drift, diameter * 0.08f),
-        )
-        drawCircle(
-            color = colors.primary.copy(alpha = 0.42f),
-            radius = baseRadius * 0.74f * pulse,
-            center = center + Offset(diameter * 0.05f, diameter * 0.03f * drift),
-        )
-        drawCircle(
-            color = colors.surface.copy(alpha = 0.26f),
-            radius = baseRadius * 0.32f,
-            center = center + Offset(-diameter * 0.08f, -diameter * 0.10f),
-        )
+    Box(modifier = modifier, contentAlignment = Alignment.Center) {
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            shape = CircleShape,
+            color = if (active) colors.secondaryContainer else colors.surfaceVariant,
+        ) {}
+        Surface(
+            modifier = Modifier.fillMaxSize(0.72f),
+            shape = CircleShape,
+            color = if (active) colors.secondary else colors.outlineVariant,
+        ) {}
+        Surface(
+            modifier = Modifier.fillMaxSize(0.44f),
+            shape = CircleShape,
+            color = colors.surface,
+            border = BorderStroke(1.dp, if (active) colors.secondary else colors.outline),
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Icon(
+                    Icons.AutoMirrored.Filled.VolumeUp,
+                    contentDescription = null,
+                    modifier = Modifier.size(28.dp),
+                    tint = if (active) colors.secondary else colors.onSurfaceVariant,
+                )
+            }
+        }
     }
 }
 
@@ -709,22 +712,42 @@ private fun Toolbar(
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        Button(onClick = onBluetooth, enabled = !state.connecting) {
+        Button(
+            onClick = onBluetooth,
+            modifier = Modifier.sizeIn(minHeight = 48.dp),
+            enabled = !state.connecting,
+            shape = NeoShape,
+        ) {
             Icon(Icons.Filled.Bluetooth, contentDescription = null)
             ButtonGap()
             Text("蓝牙")
         }
-        FilledTonalButton(onClick = onScan, enabled = state.adapterReady && !state.scanning) {
+        FilledTonalButton(
+            onClick = onScan,
+            modifier = Modifier.sizeIn(minHeight = 48.dp),
+            enabled = state.adapterReady && !state.scanning,
+            shape = NeoShape,
+        ) {
             Icon(Icons.Filled.Search, contentDescription = null)
             ButtonGap()
             Text("扫描")
         }
-        FilledTonalButton(onClick = onStopScan, enabled = state.scanning) {
+        FilledTonalButton(
+            onClick = onStopScan,
+            modifier = Modifier.sizeIn(minHeight = 48.dp),
+            enabled = state.scanning,
+            shape = NeoShape,
+        ) {
             Icon(Icons.Filled.Stop, contentDescription = null)
             ButtonGap()
             Text("停扫")
         }
-        OutlinedButton(onClick = onDisconnect, enabled = state.connected) {
+        OutlinedButton(
+            onClick = onDisconnect,
+            modifier = Modifier.sizeIn(minHeight = 48.dp),
+            enabled = state.connected,
+            shape = NeoShape,
+        ) {
             Icon(Icons.Filled.LinkOff, contentDescription = null)
             ButtonGap()
             Text("断开")
@@ -737,33 +760,69 @@ private fun Toolbar(
 }
 
 @Composable
-private fun StatusBadge(connected: Boolean) {
-    val container = if (connected) {
-        MaterialTheme.colorScheme.primaryContainer
-    } else {
-        MaterialTheme.colorScheme.errorContainer
+private fun StatusBadge(connected: Boolean, heartbeatOk: Boolean) {
+    Column(
+        modifier = Modifier.padding(horizontal = 6.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        HeaderStatusLine("BLE", connected)
+        HeaderStatusLine("PICO", heartbeatOk, warning = connected && !heartbeatOk)
     }
-    val content = if (connected) {
-        MaterialTheme.colorScheme.onPrimaryContainer
-    } else {
-        MaterialTheme.colorScheme.onErrorContainer
+}
+
+@Composable
+private fun HeaderStatusLine(label: String, ok: Boolean, warning: Boolean = false) {
+    val color = when {
+        ok -> MaterialTheme.colorScheme.secondary
+        warning -> MaterialTheme.colorScheme.tertiary
+        else -> MaterialTheme.colorScheme.error
+    }
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Icon(
+            imageVector = if (ok) Icons.Filled.CheckCircle else Icons.Filled.Warning,
+            contentDescription = null,
+            modifier = Modifier.size(13.dp),
+            tint = color,
+        )
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = color,
+            fontFamily = FontFamily.Monospace,
+        )
+    }
+}
+
+@Composable
+private fun PicoConnectionAlert(state: CartUiState) {
+    val timedOut = state.connected && state.picoHeartbeatStatus == "Pico 心跳超时"
+    val message = when {
+        !state.connected -> "请初始化蓝牙并扫描连接 Pico。控制命令保持锁定。"
+        timedOut -> "心跳已超时。请检查供电与距离，恢复心跳后控制会自动解锁。"
+        else -> "正在校验 Pico 心跳，确认设备安全后控制会自动解锁。"
     }
     Surface(
-        color = container,
-        contentColor = content,
-        shape = RoundedCornerShape(8.dp),
+        color = if (timedOut) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.tertiaryContainer,
+        contentColor = if (timedOut) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onTertiaryContainer,
+        shape = NeoSoftShape,
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+            modifier = Modifier.padding(12.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Icon(
-                imageVector = if (connected) Icons.Filled.CheckCircle else Icons.Filled.Warning,
-                contentDescription = null,
-                modifier = Modifier.size(16.dp),
-            )
-            Spacer(Modifier.width(6.dp))
-            Text(if (connected) "已连接" else "未连接", style = MaterialTheme.typography.labelMedium)
+            Icon(Icons.Filled.Warning, contentDescription = null, modifier = Modifier.size(24.dp))
+            Column {
+                Text(
+                    if (timedOut) "Pico 心跳中断" else "恢复控制连接",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                )
+                Text(message, style = MaterialTheme.typography.bodySmall)
+            }
         }
     }
 }
@@ -776,20 +835,30 @@ private fun Section(
 ) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(8.dp),
+        shape = NeoSoftShape,
         tonalElevation = 1.dp,
+        color = MaterialTheme.colorScheme.surface,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
     ) {
-        Column(Modifier.padding(14.dp)) {
+        Column(Modifier.padding(horizontal = 14.dp, vertical = 12.dp)) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                Text(
+                    title,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
                 trailing?.invoke()
             }
-            Spacer(Modifier.height(12.dp))
+            HorizontalDivider(
+                modifier = Modifier.padding(top = 10.dp, bottom = 12.dp),
+                color = MaterialTheme.colorScheme.outlineVariant,
+            )
             content()
         }
     }
@@ -820,11 +889,10 @@ private fun StatusPill(
         StatusTone.Muted -> colors.surfaceVariant to colors.onSurfaceVariant
     }
     Surface(
-        modifier = modifier.sizeIn(minHeight = 44.dp),
-        shape = RoundedCornerShape(8.dp),
+        modifier = modifier.sizeIn(minHeight = 48.dp),
+        shape = NeoShape,
         color = container,
         contentColor = content,
-        border = BorderStroke(1.dp, content.copy(alpha = 0.22f)),
     ) {
         Row(
             modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
@@ -849,17 +917,38 @@ private fun StatusPill(
 @Composable
 private fun DriveStatusStrip(state: CartUiState) {
     val estop = state.status.isTruthy("estop") || state.status.isTruthy("unsafe")
-    Section(title = "顶部状态") {
+    val controlLocked = !state.cartReady
+    Section(title = "系统就绪状态") {
         FlowRow(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             StatusPill(
                 label = "蓝牙",
                 value = if (state.connected) "已连接" else if (state.adapterReady) "待连接" else "未就绪",
                 icon = Icons.Filled.Bluetooth,
                 tone = if (state.connected) StatusTone.Normal else StatusTone.Warning,
+            )
+            StatusPill(
+                label = "心跳",
+                value = state.picoHeartbeatStatus,
+                icon = if (state.picoHeartbeatOk) Icons.Filled.CheckCircle else Icons.Filled.Warning,
+                tone = if (state.picoHeartbeatOk) StatusTone.Normal else StatusTone.Warning,
+            )
+            StatusPill(
+                label = "安全",
+                value = when {
+                    controlLocked -> "控制锁定"
+                    estop -> "急停 / 异常"
+                    else -> "安全可控"
+                },
+                icon = if (controlLocked || estop) Icons.Filled.Warning else Icons.Filled.CheckCircle,
+                tone = when {
+                    estop -> StatusTone.Danger
+                    controlLocked -> StatusTone.Warning
+                    else -> StatusTone.Normal
+                },
             )
             StatusPill(
                 label = "电池",
@@ -874,10 +963,10 @@ private fun DriveStatusStrip(state: CartUiState) {
                 tone = if (state.connected) StatusTone.Accent else StatusTone.Muted,
             )
             StatusPill(
-                label = "安全",
-                value = if (estop) "急停/异常" else "安全",
-                icon = if (estop) Icons.Filled.Warning else Icons.Filled.CheckCircle,
-                tone = if (estop) StatusTone.Danger else StatusTone.Normal,
+                label = "手柄",
+                value = if (state.gamepadState.connected) "已连接" else "未检测",
+                icon = if (state.gamepadState.connected) Icons.Filled.CheckCircle else Icons.Filled.Warning,
+                tone = if (state.gamepadState.connected) StatusTone.Normal else StatusTone.Muted,
             )
         }
     }
@@ -892,7 +981,7 @@ private fun DriveCockpitSection(
     onDriveRelease: () -> Unit,
 ) {
     val estop = state.status.isTruthy("estop") || state.status.isTruthy("unsafe")
-    val enabled = state.connected && !estop
+    val enabled = state.cartReady && !estop
     val speedLevel = when {
         state.manualPower < 10f -> 1
         state.manualPower < 16f -> 2
@@ -900,30 +989,58 @@ private fun DriveCockpitSection(
         else -> 4
     }
     Section(
-        title = "驾驶舱",
+        title = "方向控制",
         trailing = {
             Text(
-                "D$speedLevel / ${state.manualPower.roundToInt()}%",
+                "D$speedLevel  ${state.manualPower.roundToInt()}%",
                 style = MaterialTheme.typography.labelLarge,
                 color = MaterialTheme.colorScheme.primary,
                 fontFamily = FontFamily.Monospace,
             )
         },
     ) {
-        CyberSteeringWheel(
-            gear = if (estop) "P" else if (enabled) "D$speedLevel" else "N",
-            steer = state.status.displayValue("steer", "0"),
-            active = enabled,
-            danger = estop,
-        )
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = NeoShape,
+            color = when {
+                estop -> MaterialTheme.colorScheme.errorContainer
+                enabled -> MaterialTheme.colorScheme.secondaryContainer
+                else -> MaterialTheme.colorScheme.surfaceVariant
+            },
+            contentColor = when {
+                estop -> MaterialTheme.colorScheme.onErrorContainer
+                enabled -> MaterialTheme.colorScheme.onSecondaryContainer
+                else -> MaterialTheme.colorScheme.onSurfaceVariant
+            },
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Icon(
+                    if (enabled) Icons.Filled.CheckCircle else Icons.Filled.Warning,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                )
+                Text(
+                    when {
+                        estop -> "安全锁已触发，方向控制已禁用"
+                        enabled -> "方向控制已启用，松手自动停车"
+                        else -> "等待 Pico 就绪，方向控制保持锁定"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+        }
         Spacer(Modifier.height(14.dp))
-        GearSelector(
-            selected = if (estop) "P" else if (enabled) "D" else "N",
-            danger = estop,
+        DrivePad(
+            enabled = enabled,
+            onDrivePress = onDrivePress,
+            onDriveRelease = onDriveRelease,
         )
-        Spacer(Modifier.height(8.dp))
-        SpeedLevelSelector(selected = speedLevel)
-        Spacer(Modifier.height(12.dp))
+        Spacer(Modifier.height(16.dp))
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -937,26 +1054,21 @@ private fun DriveCockpitSection(
             onValueChange = onPowerChange,
             valueRange = 5f..25f,
             steps = 19,
-            enabled = state.connected,
+            enabled = state.cartReady,
         )
         Text(
-            "按住方向键行驶，松手自动停车",
+            "功率范围 5–25%，建议在架空车轮时逐级测试。",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Spacer(Modifier.height(10.dp))
-        DrivePad(
-            enabled = enabled,
-            onDrivePress = onDrivePress,
-            onDriveRelease = onDriveRelease,
         )
         Spacer(Modifier.height(12.dp))
         Button(
             onClick = onStop,
             modifier = Modifier
                 .fillMaxWidth()
-                .height(56.dp),
-            enabled = state.connected,
+                .height(52.dp),
+            enabled = state.cartReady,
+            shape = NeoShape,
             colors = androidx.compose.material3.ButtonDefaults.buttonColors(
                 containerColor = MaterialTheme.colorScheme.errorContainer,
                 contentColor = MaterialTheme.colorScheme.onErrorContainer,
@@ -965,133 +1077,6 @@ private fun DriveCockpitSection(
             Icon(Icons.Filled.Stop, contentDescription = null)
             ButtonGap()
             Text("急停 / Stop", fontWeight = FontWeight.Bold)
-        }
-    }
-}
-
-@Composable
-private fun CyberSteeringWheel(
-    gear: String,
-    steer: String,
-    active: Boolean,
-    danger: Boolean,
-) {
-    val colors = MaterialTheme.colorScheme
-    val accent = when {
-        danger -> colors.error
-        active -> colors.secondary
-        else -> colors.outline
-    }
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(220.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        Canvas(modifier = Modifier.size(208.dp)) {
-            val diameter = min(size.width, size.height)
-            val center = Offset(size.width / 2f, size.height / 2f)
-            drawCircle(
-                color = accent.copy(alpha = if (active || danger) 0.18f else 0.08f),
-                radius = diameter * 0.48f,
-                center = center,
-            )
-            drawCircle(
-                color = accent.copy(alpha = 0.74f),
-                radius = diameter * 0.42f,
-                center = center,
-                style = Stroke(width = 6.dp.toPx()),
-            )
-            drawCircle(
-                color = colors.primary.copy(alpha = 0.28f),
-                radius = diameter * 0.28f,
-                center = center,
-                style = Stroke(width = 2.dp.toPx()),
-            )
-            drawCircle(
-                color = colors.surfaceVariant.copy(alpha = 0.88f),
-                radius = diameter * 0.24f,
-                center = center,
-            )
-            drawLine(
-                color = accent.copy(alpha = 0.74f),
-                start = Offset(center.x - diameter * 0.36f, center.y),
-                end = Offset(center.x - diameter * 0.14f, center.y),
-                strokeWidth = 5.dp.toPx(),
-            )
-            drawLine(
-                color = accent.copy(alpha = 0.74f),
-                start = Offset(center.x + diameter * 0.14f, center.y),
-                end = Offset(center.x + diameter * 0.36f, center.y),
-                strokeWidth = 5.dp.toPx(),
-            )
-            drawLine(
-                color = accent.copy(alpha = 0.52f),
-                start = center,
-                end = Offset(center.x, center.y + diameter * 0.34f),
-                strokeWidth = 5.dp.toPx(),
-            )
-        }
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(
-                gear,
-                style = MaterialTheme.typography.headlineMedium,
-                fontWeight = FontWeight.Bold,
-                fontFamily = FontFamily.Monospace,
-                color = accent,
-            )
-            Text(
-                "转向 $steer°",
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                fontFamily = FontFamily.Monospace,
-            )
-        }
-    }
-}
-
-@Composable
-private fun GearSelector(selected: String, danger: Boolean) {
-    val gears = listOf("P", "N", "D", "R")
-    FlowRow(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.Center,
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        gears.forEach { gear ->
-            FilterChip(
-                selected = selected == gear,
-                onClick = {},
-                label = { Text(gear, fontFamily = FontFamily.Monospace) },
-                leadingIcon = if (selected == gear) {
-                    {
-                        Icon(
-                            if (danger && gear == "P") Icons.Filled.Warning else Icons.Filled.CheckCircle,
-                            contentDescription = null,
-                            modifier = Modifier.size(18.dp),
-                        )
-                    }
-                } else {
-                    null
-                },
-            )
-        }
-    }
-}
-
-@Composable
-private fun SpeedLevelSelector(selected: Int) {
-    FlowRow(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.Center,
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        (1..4).forEach { level ->
-            FilterChip(
-                selected = selected == level,
-                onClick = {},
-                label = { Text("D$level", fontFamily = FontFamily.Monospace) },
-            )
         }
     }
 }
@@ -1106,7 +1091,7 @@ private fun RecentCommandSection(
     Section(
         title = "最近指令",
         trailing = {
-            TextButton(onClick = onStatus, enabled = state.connected) {
+            TextButton(onClick = onStatus, enabled = state.cartReady) {
                 Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
                 ButtonGap()
                 Text("刷新")
@@ -1126,85 +1111,27 @@ private fun RecentCommandSection(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            FilledTonalButton(onClick = onManual, enabled = state.connected) {
+            FilledTonalButton(
+                onClick = onManual,
+                modifier = Modifier.sizeIn(minHeight = 48.dp),
+                enabled = state.cartReady,
+                shape = NeoShape,
+            ) {
                 Icon(Icons.Filled.Bluetooth, contentDescription = null, modifier = Modifier.size(18.dp))
                 ButtonGap()
                 Text("手动")
             }
-            FilledTonalButton(onClick = onAuto, enabled = state.connected) {
+            FilledTonalButton(
+                onClick = onAuto,
+                modifier = Modifier.sizeIn(minHeight = 48.dp),
+                enabled = state.cartReady,
+                shape = NeoShape,
+            ) {
                 Icon(Icons.Filled.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
                 ButtonGap()
                 Text("自动")
             }
         }
-    }
-}
-
-@Composable
-private fun GamepadStatusCard(gamepad: GamepadState) {
-    Section(
-        title = "Xbox 手柄",
-        trailing = {
-            StatusPill(
-                label = "HID",
-                value = if (gamepad.connected) "已连接" else "未检测",
-                icon = if (gamepad.connected) Icons.Filled.CheckCircle else Icons.Filled.Warning,
-                tone = if (gamepad.connected) StatusTone.Normal else StatusTone.Muted,
-            )
-        },
-    ) {
-        Text(
-            if (gamepad.connected) {
-                gamepad.deviceName.orEmpty().ifBlank { "Gamepad #${gamepad.deviceId ?: "-"}" }
-            } else {
-                "未检测到 Xbox 手柄，请先在 Android 蓝牙设置中连接手柄。"
-            },
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
-        )
-        Spacer(Modifier.height(10.dp))
-        FlowRow(
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            StatusPill(
-                label = "控制源",
-                value = "调试输入",
-                icon = Icons.Filled.Bluetooth,
-                tone = StatusTone.Accent,
-            )
-            StatusPill(
-                label = "RB 使能",
-                value = if (gamepad.buttonRb) "按住" else "未按",
-                icon = if (gamepad.buttonRb) Icons.Filled.CheckCircle else Icons.Filled.Warning,
-                tone = if (gamepad.buttonRb) StatusTone.Normal else StatusTone.Muted,
-            )
-            StatusPill(
-                label = "B 停车",
-                value = if (gamepad.buttonB) "按下" else "待命",
-                icon = Icons.Filled.Stop,
-                tone = if (gamepad.buttonB) StatusTone.Danger else StatusTone.Muted,
-            )
-        }
-        Spacer(Modifier.height(10.dp))
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                AxisCell("左摇杆 X", gamepad.axisX, Modifier.weight(1f))
-                AxisCell("左摇杆 Y", gamepad.axisY, Modifier.weight(1f))
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                AxisCell("RT / RTRIGGER", gamepad.axisRightTrigger, Modifier.weight(1f))
-                AxisCell("LT / LTRIGGER", gamepad.axisLeftTrigger, Modifier.weight(1f))
-            }
-        }
-        Spacer(Modifier.height(8.dp))
-        Text(
-            "第一阶段只显示输入，不向 Pico 发送手柄驾驶命令。",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
     }
 }
 
@@ -1250,6 +1177,7 @@ private fun GamepadDebugPanel(gamepad: GamepadState) {
         ) {
             gamepad.buttonRows.forEach { (label, pressed) ->
                 FilterChip(
+                    modifier = Modifier.sizeIn(minHeight = 48.dp),
                     selected = pressed,
                     onClick = {},
                     label = { Text(label, fontFamily = FontFamily.Monospace) },
@@ -1274,9 +1202,8 @@ private fun GamepadDebugPanel(gamepad: GamepadState) {
 private fun AxisCell(label: String, value: Float, modifier: Modifier = Modifier) {
     Surface(
         modifier = modifier.height(74.dp),
-        shape = RoundedCornerShape(8.dp),
+        shape = NeoShape,
         color = MaterialTheme.colorScheme.surfaceVariant,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
     ) {
         Column(
             modifier = Modifier.padding(10.dp),
@@ -1305,54 +1232,69 @@ private fun AxisCell(label: String, value: Float, modifier: Modifier = Modifier)
 private fun VoiceCoreSection(state: CartUiState) {
     val normalized = state.mamboLastTranscript.normalizeMamboTranscript()
     val toolItems = state.agentMessages.filter { it.role == "tool" }.takeLast(5)
-    Section(
-        title = "曼波控制核心",
-        trailing = {
+    Section(title = "曼波语音核心") {
+        FlowRow(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
             StatusPill(
-                label = "VAD",
-                value = state.mamboVoiceStatus,
-                icon = if (state.mamboListening) Icons.Filled.CheckCircle else Icons.Filled.Warning,
-                tone = when {
-                    state.mamboOverlayStatus.contains("执行") -> StatusTone.Accent
-                    state.mamboListening -> StatusTone.Normal
-                    else -> StatusTone.Muted
-                },
+                label = "唤醒",
+                value = if (state.mamboWakeEnabled) "等待“曼波”" else "未开启",
+                icon = if (state.mamboWakeEnabled) Icons.Filled.CheckCircle else Icons.Filled.Warning,
+                tone = if (state.mamboWakeEnabled) StatusTone.Normal else StatusTone.Muted,
             )
-        },
-    ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            MamboVoiceOrb(
-                active = state.mamboListening || state.agentRunning,
-                modifier = Modifier.size(156.dp),
+            StatusPill(
+                label = "识别",
+                value = if (state.mamboListening) "正在聆听" else state.mamboVoiceStatus,
+                icon = if (state.mamboListening) Icons.AutoMirrored.Filled.VolumeUp else Icons.Filled.CheckCircle,
+                tone = if (state.mamboListening) StatusTone.Normal else StatusTone.Muted,
             )
-            Spacer(Modifier.height(10.dp))
-            Text(
-                state.mamboOverlayStatus.ifBlank { state.mamboVoiceStatus },
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.primary,
-                textAlign = TextAlign.Center,
+            StatusPill(
+                label = "AI 执行",
+                value = if (state.agentRunning) "处理中" else "待命",
+                icon = if (state.agentRunning) Icons.Filled.PlayArrow else Icons.Filled.CheckCircle,
+                tone = if (state.agentRunning) StatusTone.Accent else StatusTone.Muted,
             )
-            Text(
-                state.mamboOverlayCaption.ifBlank { if (state.mamboWakeEnabled) "等待唤醒词：曼波" else "语音唤醒未开启" },
-                modifier = Modifier.fillMaxWidth(),
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                textAlign = TextAlign.Center,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Spacer(Modifier.height(12.dp))
-            WaveformView(active = state.mamboListening || state.agentRunning)
         }
         Spacer(Modifier.height(14.dp))
-        VoiceSignalRow("原始识别", state.mamboLastTranscript.ifBlank { "暂无" })
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            MamboVoiceOrb(
+                active = state.mamboListening || state.agentRunning,
+                modifier = Modifier.size(88.dp),
+            )
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    state.mamboOverlayStatus.ifBlank { state.mamboVoiceStatus },
+                    style = MaterialTheme.typography.titleMedium,
+                    color = if (state.mamboListening) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurface,
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    state.mamboOverlayCaption.ifBlank {
+                        if (state.mamboWakeEnabled) "说出“曼波”后下达指令" else "请在设置中开启语音唤醒"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                WaveformView(active = state.mamboListening || state.agentRunning)
+            }
+        }
+        Spacer(Modifier.height(14.dp))
+        VoiceSignalRow("识别文本", state.mamboLastTranscript.ifBlank { "等待语音输入" }, emphasized = true)
         VoiceSignalRow("归一化", normalized.ifBlank { "暂无" })
         VoiceSignalRow(
-            "DeepSeek",
+            "AI 执行",
             when {
-                state.agentRunning -> "正在思考"
-                state.agentMessages.any { it.role == "assistant" } -> "就绪"
-                else -> "未开始"
+                state.agentRunning -> "正在解析并执行指令"
+                state.agentMessages.any { it.role == "assistant" } -> "最近一次执行已完成"
+                else -> "等待已识别的控制意图"
             },
         )
         Spacer(Modifier.height(12.dp))
@@ -1362,36 +1304,25 @@ private fun VoiceCoreSection(state: CartUiState) {
 
 @Composable
 private fun WaveformView(active: Boolean) {
-    val transition = rememberInfiniteTransition(label = "voice-waveform")
-    val shift by transition.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(if (active) 640 else 1_600),
-            repeatMode = RepeatMode.Reverse,
-        ),
-        label = "wave-shift",
-    )
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .height(42.dp),
-        horizontalArrangement = Arrangement.Center,
+            .height(28.dp),
+        horizontalArrangement = Arrangement.Start,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        val bars = listOf(0.28f, 0.46f, 0.72f, 0.92f, 0.62f, 0.36f, 0.54f, 0.82f, 0.48f)
-        bars.forEachIndexed { index, base ->
-            val height = if (active) {
-                10.dp + (28.dp * ((base + shift + index * 0.08f) % 1f))
-            } else {
-                8.dp + (12.dp * base)
-            }
+        val bars = if (active) {
+            listOf(0.32f, 0.64f, 0.92f, 0.52f, 0.78f, 0.40f, 0.68f)
+        } else {
+            listOf(0.22f, 0.28f, 0.24f, 0.30f, 0.22f, 0.26f, 0.22f)
+        }
+        bars.forEach { level ->
             Surface(
                 modifier = Modifier
-                    .padding(horizontal = 3.dp)
-                    .width(5.dp)
-                    .height(height),
-                shape = RoundedCornerShape(8.dp),
+                    .padding(end = 4.dp)
+                    .width(4.dp)
+                    .height(6.dp + (20.dp * level)),
+                shape = NeoShape,
                 color = if (active) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.outlineVariant,
             ) {}
         }
@@ -1399,12 +1330,12 @@ private fun WaveformView(active: Boolean) {
 }
 
 @Composable
-private fun VoiceSignalRow(label: String, value: String) {
+private fun VoiceSignalRow(label: String, value: String, emphasized: Boolean = false) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(8.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        shape = NeoShape,
+        color = if (emphasized) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+        contentColor = if (emphasized) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
     ) {
         Row(
             modifier = Modifier.padding(10.dp),
@@ -1415,7 +1346,7 @@ private fun VoiceSignalRow(label: String, value: String) {
                 label,
                 modifier = Modifier.width(70.dp),
                 style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                color = if (emphasized) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Text(
                 value,
@@ -1445,7 +1376,7 @@ private fun ToolCallTimeline(items: List<AgentChatEntry>) {
         items.forEach { entry ->
             Surface(
                 modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(8.dp),
+                shape = NeoShape,
                 color = if (entry.ok == false) {
                     MaterialTheme.colorScheme.errorContainer
                 } else {
@@ -1486,10 +1417,12 @@ private fun StatusDashboardSection(
     onSpeakStatus: () -> Unit,
 ) {
     val estop = state.status.isTruthy("estop") || state.status.isTruthy("unsafe")
+    val controlLocked = !state.cartReady
     Section(
         title = "健康卡片",
         trailing = {
             AssistChip(
+                modifier = Modifier.sizeIn(minHeight = 48.dp),
                 onClick = onSpeakStatus,
                 label = { Text("朗读") },
                 leadingIcon = {
@@ -1501,11 +1434,33 @@ private fun StatusDashboardSection(
         val cards = listOf(
             HealthCardData("电池", state.status.displayValue("vbat", "未知"), state.status.displayValue("battery", "等待数据"), StatusTone.Accent),
             HealthCardData("蓝牙", if (state.connected) "已连接" else "未连接", state.deviceName.ifBlank { "Pico BLE" }, if (state.connected) StatusTone.Normal else StatusTone.Warning),
-            HealthCardData("Pico", state.status.displayValue("mode", "-"), state.status.displayValue("sensor", "等待心跳"), if (state.connected) StatusTone.Normal else StatusTone.Muted),
-            HealthCardData("安全", if (estop) "异常" else "正常", "estop=${state.status.displayValue("estop", "-")}", if (estop) StatusTone.Danger else StatusTone.Normal),
+            HealthCardData("Pico", state.picoHeartbeatStatus, state.status.displayValue("sensor", "等待心跳"), if (state.picoHeartbeatOk) StatusTone.Normal else StatusTone.Warning),
+            HealthCardData(
+                "安全",
+                when {
+                    controlLocked -> "控制锁定"
+                    estop -> "异常"
+                    else -> "正常"
+                },
+                if (controlLocked) "等待连接与心跳" else "estop=${state.status.displayValue("estop", "-")}",
+                when {
+                    estop -> StatusTone.Danger
+                    controlLocked -> StatusTone.Warning
+                    else -> StatusTone.Normal
+                },
+            ),
             HealthCardData("左轮", state.status.displayValue("pwml", "0"), "sensor=${state.status.displayValue("l", "0")}", StatusTone.Accent),
             HealthCardData("右轮", state.status.displayValue("pwmr", "0"), "sensor=${state.status.displayValue("r", "0")}", StatusTone.Accent),
-            HealthCardData("DeepSeek", if (state.agentRunning) "思考中" else "就绪", if (state.agentApiKey.isBlank()) "未配置 API Key" else "API Key 已配置", if (state.agentApiKey.isBlank()) StatusTone.Warning else StatusTone.Normal),
+            HealthCardData(
+                "DeepSeek",
+                when {
+                    state.agentRunning -> "思考中"
+                    state.agentApiKey.isBlank() -> "未配置"
+                    else -> "就绪"
+                },
+                if (state.agentApiKey.isBlank()) "请在设置中填写 API Key" else "API Key 已配置",
+                if (state.agentApiKey.isBlank()) StatusTone.Warning else StatusTone.Normal,
+            ),
             HealthCardData("语音", state.mamboVoiceStatus, if (state.mamboWakeEnabled) "唤醒开启" else "唤醒关闭", if (state.mamboWakeEnabled) StatusTone.Normal else StatusTone.Muted),
             HealthCardData("手柄", if (state.gamepadState.connected) "已连接" else "未检测", state.gamepadState.deviceName ?: "Xbox HID", if (state.gamepadState.connected) StatusTone.Normal else StatusTone.Muted),
         )
@@ -1542,10 +1497,9 @@ private fun HealthCard(data: HealthCardData, modifier: Modifier = Modifier) {
         StatusTone.Muted -> colors.outline
     }
     Surface(
-        modifier = modifier.height(104.dp),
-        shape = RoundedCornerShape(8.dp),
+        modifier = modifier.sizeIn(minHeight = 104.dp),
+        shape = NeoShape,
         color = MaterialTheme.colorScheme.surfaceVariant,
-        border = BorderStroke(1.dp, accent.copy(alpha = 0.42f)),
     ) {
         Column(
             modifier = Modifier.padding(12.dp),
@@ -1586,9 +1540,10 @@ private fun DebugActionSection(
         title = "工程操作",
         trailing = {
             FilterChip(
+                modifier = Modifier.sizeIn(minHeight = 48.dp),
                 selected = state.streaming,
                 onClick = onToggleStream,
-                enabled = state.connected,
+                enabled = state.cartReady,
                 label = { Text(if (state.streaming) "stream on" else "stream off") },
             )
         },
@@ -1604,13 +1559,13 @@ private fun DebugActionSection(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            ActionButton("Stop", Icons.Filled.Stop, onStop, enabled = state.connected, danger = true)
-            ActionButton("读取状态", Icons.Filled.Refresh, onStatus, enabled = state.connected)
-            ActionButton("手动", Icons.Filled.Bluetooth, onManual, enabled = state.connected)
-            ActionButton("自动", Icons.Filled.PlayArrow, onAuto, enabled = state.connected)
-            ActionButton("HX711 归零", Icons.Filled.Refresh, onTare, enabled = state.connected)
-            ActionButton("闪灯识别", Icons.Filled.Warning, onIdentify, enabled = state.connected)
-            ActionButton(if (state.streaming) "关流" else "开流", Icons.Filled.PlayArrow, onToggleStream, enabled = state.connected)
+            ActionButton("Stop", Icons.Filled.Stop, onStop, enabled = state.cartReady, danger = true)
+            ActionButton("读取状态", Icons.Filled.Refresh, onStatus, enabled = state.cartReady)
+            ActionButton("手动", Icons.Filled.Bluetooth, onManual, enabled = state.cartReady)
+            ActionButton("自动", Icons.Filled.PlayArrow, onAuto, enabled = state.cartReady)
+            ActionButton("HX711 归零", Icons.Filled.Refresh, onTare, enabled = state.cartReady)
+            ActionButton("闪灯识别", Icons.Filled.Warning, onIdentify, enabled = state.cartReady)
+            ActionButton(if (state.streaming) "关流" else "开流", Icons.Filled.PlayArrow, onToggleStream, enabled = state.cartReady)
         }
     }
 }
@@ -1661,9 +1616,8 @@ private fun DeviceRow(
     Surface(
         onClick = onConnect,
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(8.dp),
-        color = MaterialTheme.colorScheme.surface,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        shape = NeoShape,
+        color = MaterialTheme.colorScheme.surfaceVariant,
     ) {
         Row(
             modifier = Modifier.padding(12.dp),
@@ -1782,6 +1736,7 @@ private fun AgentSection(
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             AssistChip(
+                modifier = Modifier.sizeIn(minHeight = 48.dp),
                 onClick = {},
                 label = { Text(if (state.agentApiKey.isBlank()) "未配置 API Key" else "API Key 已配置") },
                 leadingIcon = {
@@ -1793,6 +1748,7 @@ private fun AgentSection(
                 },
             )
             AssistChip(
+                modifier = Modifier.sizeIn(minHeight = 48.dp),
                 onClick = {},
                 label = { Text(if (state.agentMovementUnlocked) "移动已解锁" else "移动锁定") },
                 leadingIcon = {
@@ -1804,6 +1760,7 @@ private fun AgentSection(
                 },
             )
             AssistChip(
+                modifier = Modifier.sizeIn(minHeight = 48.dp),
                 onClick = {},
                 label = { Text(state.mamboVoiceStatus) },
                 leadingIcon = {
@@ -1830,7 +1787,7 @@ private fun AgentSection(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(320.dp),
-            shape = RoundedCornerShape(8.dp),
+            shape = NeoShape,
             color = MaterialTheme.colorScheme.surface,
             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
         ) {
@@ -1863,7 +1820,9 @@ private fun AgentSection(
             )
             Button(
                 onClick = onRunAgent,
+                modifier = Modifier.sizeIn(minHeight = 48.dp),
                 enabled = !state.agentRunning && state.agentInput.isNotBlank(),
+                shape = NeoShape,
             ) {
                 Icon(Icons.AutoMirrored.Filled.Send, contentDescription = null, modifier = Modifier.size(18.dp))
                 ButtonGap()
@@ -1901,7 +1860,7 @@ private fun AgentMessageLine(entry: AgentChatEntry) {
 
     Surface(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(8.dp),
+        shape = NeoShape,
         color = containerColor,
         contentColor = contentColor,
     ) {
@@ -1921,6 +1880,7 @@ private fun StatusSection(
         title = "状态",
         trailing = {
             AssistChip(
+                modifier = Modifier.sizeIn(minHeight = 48.dp),
                 onClick = onSpeakStatus,
                 label = { Text("朗读") },
                 leadingIcon = {
@@ -1979,9 +1939,8 @@ private fun MetricGrid(status: Map<String, String>) {
 private fun MetricCell(label: String, value: String, modifier: Modifier = Modifier) {
     Surface(
         modifier = modifier.height(76.dp),
-        shape = RoundedCornerShape(8.dp),
-        color = MaterialTheme.colorScheme.surface,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        shape = NeoShape,
+        color = MaterialTheme.colorScheme.surfaceVariant,
     ) {
         Column(
             modifier = Modifier.padding(10.dp),
@@ -2001,62 +1960,6 @@ private fun MetricCell(label: String, value: String, modifier: Modifier = Modifi
 }
 
 @Composable
-private fun ControlSection(
-    state: CartUiState,
-    onAuto: () -> Unit,
-    onManual: () -> Unit,
-    onStop: () -> Unit,
-    onTare: () -> Unit,
-    onIdentify: () -> Unit,
-    onToggleStream: () -> Unit,
-    onStatus: () -> Unit,
-    onPowerChange: (Float) -> Unit,
-    onDrivePress: (String) -> Unit,
-    onDriveRelease: () -> Unit,
-) {
-    Section(
-        title = "控制",
-        trailing = {
-            FilterChip(
-                selected = state.streaming,
-                onClick = onToggleStream,
-                label = { Text(if (state.streaming) "stream on" else "stream off") },
-            )
-        },
-    ) {
-        FlowRow(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            ActionButton("停止", Icons.Filled.Stop, onStop)
-            ActionButton("自动", Icons.Filled.PlayArrow, onAuto)
-            ActionButton("手动", Icons.Filled.Bluetooth, onManual)
-            ActionButton("归零", Icons.Filled.Refresh, onTare)
-            ActionButton("闪灯", Icons.Filled.Warning, onIdentify)
-            ActionButton(if (state.streaming) "关流" else "开流", Icons.Filled.PlayArrow, onToggleStream)
-            ActionButton("状态", Icons.Filled.Refresh, onStatus)
-        }
-        Spacer(Modifier.height(12.dp))
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text("手动功率", style = MaterialTheme.typography.bodyMedium)
-            Text("${state.manualPower.roundToInt()}%", style = MaterialTheme.typography.labelLarge)
-        }
-        Slider(
-            value = state.manualPower,
-            onValueChange = onPowerChange,
-            valueRange = 5f..25f,
-            steps = 19,
-        )
-        DrivePad(onDrivePress = onDrivePress, onDriveRelease = onDriveRelease)
-    }
-}
-
-@Composable
 private fun ActionButton(
     label: String,
     icon: ImageVector,
@@ -2066,7 +1969,9 @@ private fun ActionButton(
 ) {
     FilledTonalButton(
         onClick = onClick,
+        modifier = Modifier.sizeIn(minHeight = 48.dp),
         enabled = enabled,
+        shape = NeoShape,
         colors = if (danger) {
             androidx.compose.material3.ButtonDefaults.filledTonalButtonColors(
                 containerColor = MaterialTheme.colorScheme.errorContainer,
@@ -2113,6 +2018,7 @@ private fun DrivePad(
                 onClick = onDriveRelease,
                 modifier = Modifier.sizeIn(minWidth = 80.dp, minHeight = 56.dp),
                 enabled = enabled,
+                shape = NeoShape,
                 colors = androidx.compose.material3.ButtonDefaults.elevatedButtonColors(
                     containerColor = MaterialTheme.colorScheme.errorContainer,
                     contentColor = MaterialTheme.colorScheme.onErrorContainer,
@@ -2166,10 +2072,10 @@ private fun DriveButton(
                     },
                 )
             },
-        shape = RoundedCornerShape(8.dp),
-        color = if (enabled) MaterialTheme.colorScheme.surface else MaterialTheme.colorScheme.surfaceVariant,
-        contentColor = if (enabled) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
-        border = BorderStroke(1.dp, if (enabled) MaterialTheme.colorScheme.outline else MaterialTheme.colorScheme.outlineVariant),
+        shape = NeoShape,
+        color = if (enabled) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+        contentColor = if (enabled) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+        border = if (enabled) BorderStroke(1.dp, MaterialTheme.colorScheme.primary) else null,
     ) {
         Row(
             modifier = Modifier.padding(horizontal = 14.dp),
@@ -2193,7 +2099,7 @@ private fun ParamsSection(
     Section(
         title = "参数",
         trailing = {
-            TextButton(onClick = onParamQuery) {
+            TextButton(onClick = onParamQuery, enabled = state.cartReady) {
                 Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
                 ButtonGap()
                 Text("刷新")
@@ -2204,9 +2110,8 @@ private fun ParamsSection(
             state.paramRows.forEach { (key, value) ->
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(8.dp),
-                    color = MaterialTheme.colorScheme.surface,
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                    shape = NeoShape,
+                    color = MaterialTheme.colorScheme.surfaceVariant,
                 ) {
                     Column(Modifier.padding(10.dp)) {
                         Text(
@@ -2231,7 +2136,12 @@ private fun ParamsSection(
                                 singleLine = true,
                                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                             )
-                            OutlinedButton(onClick = { onApplyParam(key) }) {
+                            OutlinedButton(
+                                onClick = { onApplyParam(key) },
+                                modifier = Modifier.sizeIn(minHeight = 48.dp),
+                                enabled = state.cartReady,
+                                shape = NeoShape,
+                            ) {
                                 Text("写入")
                             }
                         }
@@ -2268,7 +2178,12 @@ private fun CommandLogSection(
                 textStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = FontFamily.Monospace),
                 placeholder = { Text("status") },
             )
-            Button(onClick = onSendCustom) {
+            Button(
+                onClick = onSendCustom,
+                modifier = Modifier.sizeIn(minHeight = 48.dp),
+                enabled = state.cartReady,
+                shape = NeoShape,
+            ) {
                 Icon(Icons.AutoMirrored.Filled.Send, contentDescription = null, modifier = Modifier.size(18.dp))
                 ButtonGap()
                 Text("发送")
@@ -2279,7 +2194,7 @@ private fun CommandLogSection(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(220.dp),
-            shape = RoundedCornerShape(8.dp),
+            shape = NeoShape,
             color = MaterialTheme.colorScheme.surface,
             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
         ) {
@@ -2331,7 +2246,7 @@ private fun LogSettingsSection(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(220.dp),
-            shape = RoundedCornerShape(8.dp),
+            shape = NeoShape,
             color = MaterialTheme.colorScheme.surface,
             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
         ) {
@@ -2356,7 +2271,11 @@ private fun LogSettingsSection(
 
 @Composable
 private fun LogButton(label: String, icon: ImageVector, onClick: () -> Unit) {
-    OutlinedButton(onClick = onClick) {
+    OutlinedButton(
+        onClick = onClick,
+        modifier = Modifier.sizeIn(minHeight = 48.dp),
+        shape = NeoShape,
+    ) {
         Icon(icon, contentDescription = null, modifier = Modifier.size(18.dp))
         ButtonGap()
         Text(label)

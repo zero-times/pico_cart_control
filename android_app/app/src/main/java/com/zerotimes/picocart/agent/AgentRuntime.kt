@@ -26,6 +26,7 @@ class AgentRuntime(
         userText: String,
         apiKey: String,
         cartStatus: CartStatus,
+        cartConnectionError: String? = null,
         movementUnlocked: Boolean,
         onEvent: suspend (AgentRuntimeEvent) -> Unit = {},
     ): AgentTurnResult = withContext(Dispatchers.IO) {
@@ -44,7 +45,7 @@ class AgentRuntime(
         val tools = ToolRegistry.availableTools(
             mode = if (cartStatus.fault != null) "fault" else cartStatus.mode,
         )
-        var messages = buildMessages(sessionId, cartStatus)
+        var messages = buildMessages(sessionId, cartStatus, cartConnectionError)
         var lastUsage: Usage? = null
 
         repeat(MAX_TOOL_ROUNDS) { round ->
@@ -134,6 +135,7 @@ class AgentRuntime(
     private fun buildMessages(
         sessionId: String,
         cartStatus: CartStatus,
+        cartConnectionError: String?,
     ): List<ChatMessage> {
         return listOf(
             ChatMessage(
@@ -159,6 +161,11 @@ class AgentRuntime(
                 role = "system",
                 name = "cart_status",
                 content = cartStatus.toJson().toString(),
+            ),
+            ChatMessage(
+                role = "system",
+                name = "cart_connection",
+                content = cartConnectionError?.let { "unavailable: $it" } ?: "ready",
             ),
         ) + store.getRecentMessages(sessionId, limit = 20)
     }

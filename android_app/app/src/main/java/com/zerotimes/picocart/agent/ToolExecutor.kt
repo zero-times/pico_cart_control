@@ -11,11 +11,21 @@ package com.zerotimes.picocart.agent
  * [com.zerotimes.picocart.ble.PicoBleClient] or a serial client.
  */
 interface CartHardware {
+    /**
+     * Returns a user-facing reason when the transport is not safe to use.
+     * A BLE GATT connection alone is not sufficient: Pico must also have a
+     * recent application-level heartbeat.
+     */
+    fun connectionError(): String? = null
+
+    /** Details about the most recent command or status request failure. */
+    fun lastOperationError(): String? = null
+
     /** Read full status from the cart. Returns null on failure. */
     suspend fun getStatus(): CartStatus?
 
     /** Immediate stop. */
-    suspend fun stop()
+    suspend fun stop(): Boolean
 
     /** Set cart operating mode. */
     suspend fun setMode(mode: String): Boolean
@@ -55,6 +65,9 @@ class CartToolExecutor(
 
     override suspend fun execute(toolCall: ToolCall): ToolResult {
         return try {
+            hardware.connectionError()?.let { error ->
+                return ToolResult.error(error)
+            }
             val args = org.json.JSONObject(toolCall.function.arguments)
             when (toolCall.function.name) {
                 "cart_get_status" -> {
@@ -69,13 +82,16 @@ class CartToolExecutor(
                             "right_pwm" to (status.rightPwm ?: JSON_NULL)
                         ))
                     } else {
-                        ToolResult.error("Failed to read cart status")
+                        ToolResult.error(hardware.lastOperationError() ?: "Pico 状态读取失败")
                     }
                 }
 
                 "cart_stop" -> {
-                    hardware.stop()
-                    ToolResult.success(mapOf("action" to "stop"))
+                    if (hardware.stop()) {
+                        ToolResult.success(mapOf("action" to "stop"))
+                    } else {
+                        ToolResult.error(hardware.lastOperationError() ?: "Pico 停车命令发送失败")
+                    }
                 }
 
                 "cart_set_mode" -> {
@@ -85,7 +101,7 @@ class CartToolExecutor(
                     } else {
                         val ok = hardware.setMode(mode)
                         if (ok) ToolResult.success(mapOf("mode" to mode))
-                        else ToolResult.error("Failed to set mode to '$mode'")
+                        else ToolResult.error(hardware.lastOperationError() ?: "设置模式 '$mode' 失败")
                     }
                 }
 
@@ -98,7 +114,7 @@ class CartToolExecutor(
                         "direction" to direction,
                         "speed_level" to speedLevel,
                         "duration_ms" to durationMs
-                    )) else ToolResult.error("cart_move failed")
+                    )) else ToolResult.error(hardware.lastOperationError() ?: "cart_move 执行失败")
                 }
 
                 "cart_turn" -> {
@@ -110,7 +126,7 @@ class CartToolExecutor(
                         "direction" to direction,
                         "speed_level" to speedLevel,
                         "duration_ms" to durationMs
-                    )) else ToolResult.error("cart_turn failed")
+                    )) else ToolResult.error(hardware.lastOperationError() ?: "cart_turn 执行失败")
                 }
 
                 else -> ToolResult.error("Unknown tool: ${toolCall.function.name}")

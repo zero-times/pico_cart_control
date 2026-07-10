@@ -164,7 +164,7 @@ class PicoBleClient(
         discoveryStarted = false
     }
 
-    fun sendCommand(command: String) {
+    fun sendCommand(command: String, logCommand: Boolean = true) {
         val trimmed = command.trim()
         if (trimmed.isEmpty()) return
         scope.launch {
@@ -178,7 +178,9 @@ class PicoBleClient(
                     return@withLock
                 }
                 val bytes = "$trimmed\n".toByteArray(Charsets.UTF_8)
-                onEvent(BleEvent.Log("> $trimmed"))
+                if (logCommand) {
+                    onEvent(BleEvent.Log("> $trimmed"))
+                }
                 bytes.asIterable().chunked(18).forEach { chunk ->
                     val payload = chunk.map { it.toByte() }.toByteArray()
                     writeChunk(currentGatt, characteristic, payload)
