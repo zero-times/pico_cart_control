@@ -36,6 +36,8 @@ object PicoProtocol {
         "right_motor_gain",
         "left_force_gain",
         "right_force_gain",
+        "tow_left_comp",
+        "tow_right_comp",
     )
 
     val defaultParamInputs = linkedMapOf(
@@ -50,7 +52,15 @@ object PicoProtocol {
         "right_motor_gain" to "1.00",
         "left_force_gain" to "1.00",
         "right_force_gain" to "1.00",
+        "tow_left_comp" to "0",
+        "tow_right_comp" to "0",
     )
+
+    fun parameterLabel(key: String): String = when (key) {
+        "tow_left_comp" -> "牵引左通道补偿（原始拉力）"
+        "tow_right_comp" -> "牵引右通道补偿（原始拉力）"
+        else -> key
+    }
 
     fun parseLine(line: String): ParsedLine {
         val raw = line.trim()

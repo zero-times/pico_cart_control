@@ -64,9 +64,20 @@ class AgentRuntime(
                 maxTokens = 900,
                 temperature = 0.1,
             ).getOrElse { error ->
-                val text = "DeepSeek 请求失败：${error.message ?: error::class.java.simpleName}"
+                val certificateFailure = error.hasCertificateTrustFailure()
+                val text = if (certificateFailure) {
+                    "DeepSeek TLS 证书校验失败。请关闭 HTTPS 解密代理、抓包 VPN 或企业 Wi-Fi 代理；" +
+                        "调试包可在系统中安装该代理的根证书后重试。应用不会跳过证书校验。"
+                } else {
+                    "DeepSeek 请求失败：${error.message ?: error::class.java.simpleName}"
+                }
                 store.addAssistantMessage(sessionId, text)
-                return@withContext AgentTurnResult(text = text, speakText = "DeepSeek 请求失败，请检查网络或密钥。", usage = lastUsage)
+                val speakText = if (certificateFailure) {
+                    "DeepSeek 证书校验失败，请检查网络代理。"
+                } else {
+                    "DeepSeek 请求失败，请检查网络或密钥。"
+                }
+                return@withContext AgentTurnResult(text = text, speakText = speakText, usage = lastUsage)
             }
 
             lastUsage = response.usage
@@ -193,6 +204,13 @@ class AgentRuntime(
     private companion object {
         const val MAX_TOOL_ROUNDS = 4
         val MAMBO_SAY_REGEX = Regex("<mambo_say>(.*?)</mambo_say>", RegexOption.DOT_MATCHES_ALL)
+    }
+}
+
+private fun Throwable.hasCertificateTrustFailure(): Boolean {
+    return generateSequence(this) { it.cause }.any { cause ->
+        cause is java.security.cert.CertPathValidatorException ||
+            cause is javax.net.ssl.SSLHandshakeException
     }
 }
 

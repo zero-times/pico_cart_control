@@ -101,6 +101,10 @@ data class CartUiState(
             "rraw" to "0",
             "l" to "0",
             "r" to "0",
+            "ltow" to "0",
+            "rtow" to "0",
+            "lbase" to "0",
+            "rbase" to "0",
             "total" to "0",
             "steer" to "0",
             "pwml" to "0",
@@ -263,6 +267,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun sendStatus() = sendCommand("status")
     fun sendParamQuery() = sendCommand("param")
+    // "auto" is kept on the wire for older Pico firmware; current firmware reports this as tow mode.
     fun sendAuto() = sendCommand("auto")
     fun sendManual() = sendCommand("manual")
     fun sendStop() = sendCommand("stop")
@@ -870,7 +875,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun currentCartStatus(): CartStatus {
         val status = _uiState.value.status
         val err = status["err"].asFault()
-        val unsafe = status["unsafe"].asFault()
+        val unsafe = status["unsafe"].asHardwareFault()
         return CartStatus(
             mode = status["mode"].orEmpty().takeUnless { it.isBlank() || it == "-" } ?: "idle",
             estop = status["estop"].isEstopActive(),
@@ -934,6 +939,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         fun String?.asFault(): String? {
             val normalized = this?.trim().orEmpty()
             return normalized.takeIf { it.isNotBlank() && it != "-" && it != "ok" }
+        }
+
+        fun String?.asHardwareFault(): String? {
+            val normalized = this?.trim()?.lowercase(Locale.US).orEmpty()
+            return normalized.takeIf {
+                it.isNotBlank() && it !in setOf("-", "0", "false", "ok", "none", "manual_timeout")
+            }
         }
     }
 }

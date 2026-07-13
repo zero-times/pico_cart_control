@@ -134,7 +134,17 @@ MOTOR_TEST_MODE = False
 MOTOR_TEST_PWM = 0.20
 MOTOR_TEST_STEP_MS = 1800
 
-MODE_AUTO = "auto"
+# Tow-rope (auto) safety: both sensors must be released below this before arming.
+TOW_RELEASE_THRESHOLD_RAW = 2500
+# Minimum per-side pull required for tow drive to engage after release.
+TOW_MIN_VALID_PULL_RAW = 3000
+# Capture each sensor's current minimum after entering tow mode. Motors remain stopped.
+TOW_BASELINE_CAPTURE_MS = 700
+# Optional additional per-side raw compensation, after the per-session baseline.
+TOW_LEFT_COMP_RAW = 0
+TOW_RIGHT_COMP_RAW = 0
+
+MODE_AUTO = "tow"
 MODE_IDLE = "idle"
 MODE_MANUAL = "manual"
 AUTO_MODE_ON_START = False
@@ -508,11 +518,22 @@ class CartController:
         self.manual_left = 0.0
         self.manual_right = 0.0
         self.last_manual_ms = ticks_ms()
+        self.drive_status = "idle"
+        self.tow_armed = False
+        self.tow_baseline_started_ms = 0
+        self.tow_left_baseline = 0.0
+        self.tow_right_baseline = 0.0
+        self.tow_left_force = 0.0
+        self.tow_right_force = 0.0
 
     def stop(self, mode=MODE_IDLE):
         self.mode = mode
         self.manual_left = 0.0
         self.manual_right = 0.0
+        self.drive_status = "idle"
+        self.tow_armed = False
+        self.tow_left_force = 0.0
+        self.tow_right_force = 0.0
         self.left_motor.stop()
         self.right_motor.stop()
 
@@ -586,13 +607,36 @@ class CartController:
         self.mode = MODE_MANUAL
         self.manual_left = left
         self.manual_right = right
+        self.drive_status = "active"
         self.last_manual_ms = ticks_ms()
 
     def enter_manual(self):
         self.mode = MODE_MANUAL
         self.manual_left = 0.0
         self.manual_right = 0.0
+        self.drive_status = "active"
         self.last_manual_ms = ticks_ms()
+
+    def enter_tow(self):
+        # Treat the lowest unloaded readings after mode entry as this session's zero.
+        self.mode = MODE_AUTO
+        self.tow_armed = False
+        self.tow_baseline_started_ms = ticks_ms()
+        self.tow_left_baseline = self.left_force
+        self.tow_right_baseline = self.right_force
+        self.tow_left_force = 0.0
+        self.tow_right_force = 0.0
+        self.drive_status = "calibrating"
+        self.left_motor.stop()
+        self.right_motor.stop()
+
+    def update_tow_forces(self):
+        self.tow_left_force = max(
+            0.0, self.left_force - self.tow_left_baseline - TOW_LEFT_COMP_RAW
+        )
+        self.tow_right_force = max(
+            0.0, self.right_force - self.tow_right_baseline - TOW_RIGHT_COMP_RAW
+        )
 
     def update(self, now):
         self.read_sensors()
@@ -601,6 +645,8 @@ class CartController:
         if self.unsafe_reason:
             self.manual_left = 0.0
             self.manual_right = 0.0
+            self.tow_armed = False
+            self.drive_status = "idle"
             self.left_motor.ramp_to(0.0)
             self.right_motor.ramp_to(0.0)
             return
@@ -610,22 +656,63 @@ class CartController:
             right_target = 0.0
             self.total = self.left_force + self.right_force
             self.steer = 0.0
+            self.drive_status = "idle"
         elif self.mode == MODE_MANUAL:
             if ticks_diff(now, self.last_manual_ms) > MANUAL_TIMEOUT_MS:
+                # Dead-man stop: expected watchdog, not a hardware fault.
                 self.manual_left = 0.0
                 self.manual_right = 0.0
                 left_target = 0.0
                 right_target = 0.0
-                self.unsafe_reason = "manual_timeout"
+                self.drive_status = "timeout"
             else:
                 left_target = self.manual_left
                 right_target = self.manual_right
+                self.drive_status = "active"
             self.total = self.left_force + self.right_force
             self.steer = 0.0
         else:
-            left_target, right_target, self.total, self.steer = compute_targets(
-                self.left_force, self.right_force
-            )
+            # Tow-rope mode calibrates its own unloaded baseline on every entry.
+            calibrating = ticks_diff(now, self.tow_baseline_started_ms) < TOW_BASELINE_CAPTURE_MS
+            if calibrating:
+                self.tow_left_baseline = min(self.tow_left_baseline, self.left_force)
+                self.tow_right_baseline = min(self.tow_right_baseline, self.right_force)
+                self.tow_left_force = 0.0
+                self.tow_right_force = 0.0
+                self.total = 0.0
+                self.steer = 0.0
+                self.drive_status = "calibrating"
+                left_target = 0.0
+                right_target = 0.0
+            elif not self.tow_armed:
+                self.update_tow_forces()
+                self.total = self.tow_left_force + self.tow_right_force
+                # Wait for both force sensors to drop below the release
+                # threshold (rope slack) before arming the drive.
+                if (self.tow_left_force < TOW_RELEASE_THRESHOLD_RAW and
+                        self.tow_right_force < TOW_RELEASE_THRESHOLD_RAW):
+                    self.tow_armed = True
+                    self.drive_status = "armed"
+                else:
+                    self.drive_status = "waiting_release"
+                left_target = 0.0
+                right_target = 0.0
+                self.steer = 0.0
+            else:
+                self.update_tow_forces()
+                self.total = self.tow_left_force + self.tow_right_force
+                if (self.total >= PULL_START_RAW and
+                        self.tow_left_force >= TOW_MIN_VALID_PULL_RAW and
+                        self.tow_right_force >= TOW_MIN_VALID_PULL_RAW):
+                    left_target, right_target, _, self.steer = compute_targets(
+                        self.tow_left_force, self.tow_right_force
+                    )
+                    self.drive_status = "active"
+                else:
+                    left_target = 0.0
+                    right_target = 0.0
+                    self.steer = 0.0
+                    self.drive_status = "idle"
 
         self.left_motor.ramp_to(left_target * LEFT_MOTOR_GAIN)
         self.right_motor.ramp_to(right_target * RIGHT_MOTOR_GAIN)
@@ -633,7 +720,9 @@ class CartController:
     def status_line(self):
         return (
             "stat mode={} sensor={} err={} lraw={:.0f} rraw={:.0f} l={:.0f} r={:.0f} "
-            "total={:.0f} steer={:.2f} pwml={:.2f} pwmr={:.2f} estop={} bt={} unsafe={}"
+            "ltow={:.0f} rtow={:.0f} lbase={:.0f} rbase={:.0f} "
+            "total={:.0f} steer={:.2f} pwml={:.2f} pwmr={:.2f} estop={} bt={} "
+            "unsafe={} drive={}"
         ).format(
             self.mode,
             "ok" if self.sensor_ok else "bad",
@@ -642,6 +731,10 @@ class CartController:
             self.right_filtered,
             self.left_force,
             self.right_force,
+            self.tow_left_force,
+            self.tow_right_force,
+            self.tow_left_baseline,
+            self.tow_right_baseline,
             self.total,
             self.steer,
             self.left_motor.current,
@@ -649,6 +742,7 @@ class CartController:
             self.estop.value(),
             self.ble.connected(),
             self.unsafe_reason or "-",
+            self.drive_status,
         )
 
     def param_line(self):
@@ -657,6 +751,7 @@ class CartController:
             "steer_gain={:.2f} ramp={:.3f} manual_max={:.2f} timeout_ms={} "
             "left_motor_gain={:.2f} right_motor_gain={:.2f} "
             "left_force_gain={:.2f} right_force_gain={:.2f} "
+            "tow_left_comp={} tow_right_comp={} "
             "led_force_min={} led_force_full={}"
         ).format(
             MAX_PWM,
@@ -671,6 +766,8 @@ class CartController:
             RIGHT_MOTOR_GAIN,
             LEFT_FORCE_GAIN,
             RIGHT_FORCE_GAIN,
+            TOW_LEFT_COMP_RAW,
+            TOW_RIGHT_COMP_RAW,
             LED_FORCE_MIN_RAW,
             LED_FORCE_FULL_RAW,
         )
@@ -678,7 +775,7 @@ class CartController:
     def info_line(self):
         return (
             "info proto={} uart=UART{} tx=GP{} rx=GP{} state=GP{} "
-            "right_inb=GP{} auto_start={}"
+            "right_inb=GP{} tow_start={}"
         ).format(
             PROTOCOL_VERSION,
             BLE_UART_ID,
@@ -708,10 +805,10 @@ class CommandInterface:
 
     def help(self):
         self.reply(
-            "help cmd: ver info pins status param stream on|off identify [S] auto manual idle stop tare drive L R f [P] b [P] l [P] r [P] motor SIDE DIR [P] [MS] set NAME VALUE"
+            "help cmd: ver info pins status param stream on|off identify [S] tow auto manual idle stop tare drive L R f [P] b [P] l [P] r [P] motor SIDE DIR [P] [MS] set NAME VALUE"
         )
         self.reply(
-            "help set: max_pwm min_pwm start_raw full_raw steer_gain ramp manual_max left_motor_gain right_motor_gain left_force_gain right_force_gain"
+            "help set: max_pwm min_pwm start_raw full_raw steer_gain ramp manual_max left_motor_gain right_motor_gain left_force_gain right_force_gain tow_left_comp tow_right_comp"
         )
 
     def pins_line(self):
@@ -796,6 +893,7 @@ class CommandInterface:
         global MAX_PWM, MIN_MOVE_PWM, PULL_START_RAW, PULL_FULL_RAW
         global STEER_GAIN, RAMP_STEP, MANUAL_MAX_PWM
         global LEFT_MOTOR_GAIN, RIGHT_MOTOR_GAIN, LEFT_FORCE_GAIN, RIGHT_FORCE_GAIN
+        global TOW_LEFT_COMP_RAW, TOW_RIGHT_COMP_RAW
 
         if len(parts) != 3:
             self.reply("err usage: set NAME VALUE")
@@ -842,6 +940,12 @@ class CommandInterface:
         elif name == "right_force_gain":
             RIGHT_FORCE_GAIN = clamp(value, 0.20, 3.00)
             stored = RIGHT_FORCE_GAIN
+        elif name == "tow_left_comp":
+            TOW_LEFT_COMP_RAW = int(clamp(value, 0, MAX_SAFE_RAW))
+            stored = TOW_LEFT_COMP_RAW
+        elif name == "tow_right_comp":
+            TOW_RIGHT_COMP_RAW = int(clamp(value, 0, MAX_SAFE_RAW))
+            stored = TOW_RIGHT_COMP_RAW
         else:
             self.reply("err unknown_set_name")
             return
@@ -862,11 +966,13 @@ class CommandInterface:
             left = -power
             right = -power
         elif command == "l":
-            left = -power
-            right = power
-        else:
+            # Turn physical cart left: drive left, slow/reverse right.
             left = power
             right = -power
+        else:
+            # command == "r": turn physical cart right.
+            left = -power
+            right = power
 
         self.controller.set_manual_drive(left, right)
         self.reply("ok drive left={:.2f} right={:.2f}".format(left, right))
@@ -909,13 +1015,13 @@ class CommandInterface:
                     self.reply("ok stream=off")
                 else:
                     self.reply("err usage: stream on|off")
-            elif command == "auto":
+            elif command == "auto" or command == "tow":
                 if not self.controller.sensor_ok:
                     self.controller.stop(MODE_IDLE)
                     self.reply("err sensor_not_ready")
                 else:
-                    self.controller.mode = MODE_AUTO
-                    self.reply("ok mode=auto")
+                    self.controller.enter_tow()
+                    self.reply("ok mode=tow")
             elif command == "manual" or command == "man":
                 self.controller.enter_manual()
                 self.reply("ok mode=manual")
@@ -1024,7 +1130,7 @@ def main():
     controller.tare_sensors()
     controller.stop(MODE_IDLE)
     print(
-        "ble_commands: help pins status identify stream on|off auto manual stop tare drive L R f b l r motor set"
+        "ble_commands: help pins status identify stream on|off tow auto manual stop tare drive L R f b l r motor set"
     )
 
     last_debug = ticks_ms()

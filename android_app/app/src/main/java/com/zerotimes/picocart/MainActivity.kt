@@ -117,6 +117,7 @@ import com.zerotimes.picocart.ble.BleDeviceItem
 import com.zerotimes.picocart.gamepad.GamepadController
 import com.zerotimes.picocart.gamepad.GamepadInputReader
 import com.zerotimes.picocart.gamepad.GamepadState
+import com.zerotimes.picocart.protocol.PicoProtocol
 import com.zerotimes.picocart.speech.LocalCachedSpeechEngine
 import com.zerotimes.picocart.speech.MamboVoiceListener
 import com.zerotimes.picocart.speech.SpeechEngine
@@ -916,7 +917,7 @@ private fun StatusPill(
 
 @Composable
 private fun DriveStatusStrip(state: CartUiState) {
-    val estop = state.status.isTruthy("estop") || state.status.isTruthy("unsafe")
+    val estop = state.status.isEstopActive() || state.status.hasUnsafeFault()
     val controlLocked = !state.cartReady
     Section(title = "系统就绪状态") {
         FlowRow(
@@ -958,7 +959,7 @@ private fun DriveStatusStrip(state: CartUiState) {
             )
             StatusPill(
                 label = "模式",
-                value = state.status.displayValue("mode", if (state.connected) "手动" else "离线"),
+                value = state.status.displayMode(if (state.connected) "手动" else "离线"),
                 icon = Icons.Filled.PlayArrow,
                 tone = if (state.connected) StatusTone.Accent else StatusTone.Muted,
             )
@@ -980,7 +981,7 @@ private fun DriveCockpitSection(
     onDrivePress: (String) -> Unit,
     onDriveRelease: () -> Unit,
 ) {
-    val estop = state.status.isTruthy("estop") || state.status.isTruthy("unsafe")
+    val estop = state.status.isEstopActive() || state.status.hasUnsafeFault()
     val enabled = state.cartReady && !estop
     val speedLevel = when {
         state.manualPower < 10f -> 1
@@ -1129,7 +1130,7 @@ private fun RecentCommandSection(
             ) {
                 Icon(Icons.Filled.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
                 ButtonGap()
-                Text("自动")
+                Text("牵引绳")
             }
         }
     }
@@ -1416,7 +1417,7 @@ private fun StatusDashboardSection(
     state: CartUiState,
     onSpeakStatus: () -> Unit,
 ) {
-    val estop = state.status.isTruthy("estop") || state.status.isTruthy("unsafe")
+    val estop = state.status.isEstopActive() || state.status.hasUnsafeFault()
     val controlLocked = !state.cartReady
     Section(
         title = "健康卡片",
@@ -1562,7 +1563,7 @@ private fun DebugActionSection(
             ActionButton("Stop", Icons.Filled.Stop, onStop, enabled = state.cartReady, danger = true)
             ActionButton("读取状态", Icons.Filled.Refresh, onStatus, enabled = state.cartReady)
             ActionButton("手动", Icons.Filled.Bluetooth, onManual, enabled = state.cartReady)
-            ActionButton("自动", Icons.Filled.PlayArrow, onAuto, enabled = state.cartReady)
+            ActionButton("牵引绳", Icons.Filled.PlayArrow, onAuto, enabled = state.cartReady)
             ActionButton("HX711 归零", Icons.Filled.Refresh, onTare, enabled = state.cartReady)
             ActionButton("闪灯识别", Icons.Filled.Warning, onIdentify, enabled = state.cartReady)
             ActionButton(if (state.streaming) "关流" else "开流", Icons.Filled.PlayArrow, onToggleStream, enabled = state.cartReady)
@@ -2115,13 +2116,22 @@ private fun ParamsSection(
                 ) {
                     Column(Modifier.padding(10.dp)) {
                         Text(
-                            key,
+                            PicoProtocol.parameterLabel(key),
                             style = MaterialTheme.typography.bodySmall,
-                            fontFamily = FontFamily.Monospace,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
+                        if (PicoProtocol.parameterLabel(key) != key) {
+                            Text(
+                                key,
+                                style = MaterialTheme.typography.labelSmall,
+                                fontFamily = FontFamily.Monospace,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
                         Spacer(Modifier.height(6.dp))
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -2291,8 +2301,24 @@ private fun Map<String, String>.displayValue(key: String, fallback: String): Str
     return this[key]?.takeIf { it.isNotBlank() && it != "-" } ?: fallback
 }
 
-private fun Map<String, String>.isTruthy(key: String): Boolean {
-    return this[key]?.lowercase() in setOf("1", "true", "yes", "on", "unsafe")
+private fun Map<String, String>.isEstopActive(): Boolean {
+    return this["estop"]?.trim()?.lowercase(Locale.US) in setOf("0", "true", "active", "pressed")
+}
+
+private fun Map<String, String>.hasUnsafeFault(): Boolean {
+    val normalized = this["unsafe"]?.trim()?.lowercase(Locale.US).orEmpty()
+    return normalized.isNotBlank() && normalized !in setOf(
+        "-", "0", "false", "ok", "none", "manual_timeout",
+    )
+}
+
+private fun Map<String, String>.displayMode(fallback: String): String {
+    return when (this["mode"]?.trim()?.lowercase(Locale.US)) {
+        "tow", "auto" -> "牵引绳"
+        "manual" -> "手动"
+        "idle" -> "待命"
+        else -> displayValue("mode", fallback)
+    }
 }
 
 private fun Float.formatAxis(): String {
