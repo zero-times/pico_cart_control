@@ -31,7 +31,7 @@ BLE_UART_BAUD = 115200
 BLE_STATE_PIN = 15
 BLE_STATE_ACTIVE_HIGH = True
 BLE_LINE_MAX = 160
-PROTOCOL_VERSION = "pico-cart-ble-2026-07-15"
+PROTOCOL_VERSION = "pico-cart-ble-2026-07-15-front-ir"
 
 # HX711 modules. Each S-type load cell uses one HX711.
 LEFT_HX711_DOUT = 6
@@ -54,6 +54,13 @@ RIGHT_MOTOR_INB = 17
 # Recommended wiring: GP16 -> switch -> GND, using internal pull-up.
 # Pressed = 0, released = 1.
 ESTOP_PIN = 16
+
+# Front reflective infrared obstacle module. The common three-pin module pulls
+# OUT low when an obstacle is detected. GP22 uses an internal pull-up so an
+# unplugged sensor remains clear instead of stopping the cart at boot.
+FRONT_OBSTACLE_ENABLED = True
+FRONT_OBSTACLE_PIN = 22
+FRONT_OBSTACLE_ACTIVE_LOW = True
 
 # Non-W Pico uses GP25. Pico W/Pico 2 W MicroPython uses Pin("LED").
 FALLBACK_LED_PIN = 25
@@ -132,6 +139,9 @@ MANUAL_MAX_PWM = 0.25
 MANUAL_TIMEOUT_MS = 1200
 REVERSE_NEUTRAL_MS = 120
 MOTOR_ZERO_EPSILON = 0.002
+
+# Keep the obstacle latched until the signal has remained clear for this long.
+FRONT_OBSTACLE_CLEAR_MS = 400
 
 # Set True when you only want to test the motor driver without HX711 sensors.
 MOTOR_TEST_MODE = False
@@ -484,6 +494,56 @@ class Motor:
         self.write(0.0)
 
 
+class FrontObstacleSensor:
+    def __init__(self, pin):
+        self.pin = pin
+        self.blocked = False
+        self.clear_started_ms = None
+        self.stop_callback = None
+
+    def signal_active(self):
+        if not FRONT_OBSTACLE_ENABLED:
+            return False
+        raw = self.pin.value()
+        return raw == 0 if FRONT_OBSTACLE_ACTIVE_LOW else raw == 1
+
+    def attach_stop_callback(self, callback):
+        self.stop_callback = callback
+        if self.signal_active():
+            self.blocked = True
+            callback()
+
+        trigger = Pin.IRQ_FALLING if FRONT_OBSTACLE_ACTIVE_LOW else Pin.IRQ_RISING
+        try:
+            self.pin.irq(trigger=trigger, handler=self._handle_active_edge, hard=False)
+        except TypeError:
+            self.pin.irq(trigger=trigger, handler=self._handle_active_edge)
+
+    def _handle_active_edge(self, _pin):
+        # A single active edge is enough to stop. Clearing is deliberately
+        # debounced in update() so signal chatter cannot restart the cart.
+        if self.signal_active() and not self.blocked:
+            self.blocked = True
+            self.clear_started_ms = None
+            if self.stop_callback is not None:
+                self.stop_callback()
+
+    def update(self, now):
+        if self.signal_active():
+            self.clear_started_ms = None
+            if not self.blocked:
+                self.blocked = True
+                if self.stop_callback is not None:
+                    self.stop_callback()
+        elif self.blocked:
+            if self.clear_started_ms is None:
+                self.clear_started_ms = now
+            elif ticks_diff(now, self.clear_started_ms) >= FRONT_OBSTACLE_CLEAR_MS:
+                self.blocked = False
+                self.clear_started_ms = None
+        return self.blocked
+
+
 def safe_force(raw, sign):
     force = raw * sign
     if force < 0:
@@ -513,12 +573,15 @@ def compute_targets(left_force, right_force):
 
 
 class CartController:
-    def __init__(self, left_hx, right_hx, left_motor, right_motor, estop, ble):
+    def __init__(
+        self, left_hx, right_hx, left_motor, right_motor, estop, front_obstacle, ble
+    ):
         self.left_hx = left_hx
         self.right_hx = right_hx
         self.left_motor = left_motor
         self.right_motor = right_motor
         self.estop = estop
+        self.front_obstacle = front_obstacle
         self.ble = ble
 
         self.mode = MODE_AUTO if AUTO_MODE_ON_START else MODE_IDLE
@@ -565,6 +628,28 @@ class CartController:
         self.tow_right_force = 0.0
         self.left_motor.stop()
         self.right_motor.stop()
+
+    def front_obstacle_stop(self):
+        # Never preserve a forward target across an obstacle event. Manual mode
+        # returns to idle; tow mode must see the rope released before re-arming.
+        self.manual_left = 0.0
+        self.manual_right = 0.0
+        self.pending_manual_left = 0.0
+        self.pending_manual_right = 0.0
+        self.reverse_state = ""
+        self.soft_stop_pending = False
+        self.soft_stop_reason = ""
+        self.tow_armed = False
+        if self.mode == MODE_MANUAL:
+            self.mode = MODE_IDLE
+        self.drive_status = "front_obstacle"
+        self.left_motor.stop()
+        self.right_motor.stop()
+
+    def front_blocks_targets(self, left, right):
+        return self.front_obstacle.blocked and (
+            left > MOTOR_ZERO_EPSILON or right > MOTOR_ZERO_EPSILON
+        )
 
     def tare_sensors(self, samples=20):
         self.left_motor.stop()
@@ -633,6 +718,9 @@ class CartController:
     def set_manual_drive(self, left, right):
         left = clamp(left, -MANUAL_MAX_PWM, MANUAL_MAX_PWM)
         right = clamp(right, -MANUAL_MAX_PWM, MANUAL_MAX_PWM)
+        if self.front_blocks_targets(left, right):
+            self.front_obstacle_stop()
+            return False
         now = ticks_ms()
         self.mode = MODE_MANUAL
         self.last_manual_ms = now
@@ -657,6 +745,7 @@ class CartController:
             self.pending_manual_right = 0.0
             self.reverse_state = ""
             self.drive_status = "active"
+        return True
 
     def direction_reverses(self, current, target):
         return (
@@ -699,6 +788,10 @@ class CartController:
         self.last_manual_ms = ticks_ms()
 
     def enter_tow(self):
+        if self.front_obstacle.blocked:
+            self.stop(MODE_IDLE)
+            self.drive_status = "front_obstacle"
+            return False
         # Treat the lowest unloaded readings after mode entry as this session's zero.
         self.mode = MODE_AUTO
         self.tow_armed = False
@@ -710,6 +803,7 @@ class CartController:
         self.drive_status = "calibrating"
         self.left_motor.stop()
         self.right_motor.stop()
+        return True
 
     def update_tow_forces(self):
         self.tow_left_force = max(
@@ -720,8 +814,10 @@ class CartController:
         )
 
     def update(self, now):
+        self.front_obstacle.update(now)
         self.read_sensors()
         now = ticks_ms()
+        self.front_obstacle.update(now)
         self.unsafe_reason = self.safety_reason()
 
         if self.unsafe_reason:
@@ -733,12 +829,23 @@ class CartController:
             self.right_motor.ramp_to(0.0, now)
             return
 
+        if self.mode == MODE_AUTO and self.front_obstacle.blocked:
+            self.tow_armed = False
+            self.total = self.left_force + self.right_force
+            self.steer = 0.0
+            self.drive_status = "front_obstacle"
+            self.left_motor.stop()
+            self.right_motor.stop()
+            return
+
         if self.mode == MODE_IDLE:
             left_target = 0.0
             right_target = 0.0
             self.total = self.left_force + self.right_force
             self.steer = 0.0
-            self.drive_status = "idle"
+            self.drive_status = (
+                "front_obstacle" if self.front_obstacle.blocked else "idle"
+            )
         elif self.mode == MODE_MANUAL:
             if (not self.soft_stop_pending and
                     ticks_diff(now, self.last_manual_ms) > MANUAL_TIMEOUT_MS):
@@ -819,8 +926,14 @@ class CartController:
                     self.steer = 0.0
                     self.drive_status = "idle"
 
-        self.left_motor.ramp_to(left_target * LEFT_MOTOR_GAIN, now)
-        self.right_motor.ramp_to(right_target * RIGHT_MOTOR_GAIN, now)
+        left_target *= LEFT_MOTOR_GAIN
+        right_target *= RIGHT_MOTOR_GAIN
+        if self.front_blocks_targets(left_target, right_target):
+            self.front_obstacle_stop()
+            return
+
+        self.left_motor.ramp_to(left_target, now)
+        self.right_motor.ramp_to(right_target, now)
 
         if self.mode == MODE_MANUAL and self.soft_stop_pending and self.motors_stopped():
             self.mode = MODE_IDLE
@@ -831,7 +944,8 @@ class CartController:
             "stat mode={} sensor={} err={} lraw={:.0f} rraw={:.0f} l={:.0f} r={:.0f} "
             "ltow={:.0f} rtow={:.0f} lbase={:.0f} rbase={:.0f} "
             "total={:.0f} steer={:.2f} targetl={:.2f} targetr={:.2f} "
-            "pwml={:.2f} pwmr={:.2f} age_ms={} estop={} bt={} unsafe={} drive={}"
+            "pwml={:.2f} pwmr={:.2f} age_ms={} estop={} front={} front_signal={} "
+            "bt={} unsafe={} drive={}"
         ).format(
             self.mode,
             "ok" if self.sensor_ok else "bad",
@@ -852,6 +966,8 @@ class CartController:
             self.right_motor.current,
             max(0, ticks_diff(ticks_ms(), self.last_manual_ms)) if self.mode == MODE_MANUAL else 0,
             self.estop.value(),
+            bool_text(self.front_obstacle.blocked),
+            bool_text(self.front_obstacle.signal_active()),
             self.ble.connected(),
             self.unsafe_reason or "-",
             self.drive_status,
@@ -890,7 +1006,7 @@ class CartController:
     def info_line(self):
         return (
             "info proto={} uart=UART{} tx=GP{} rx=GP{} state=GP{} "
-            "right_inb=GP{} tow_start={}"
+            "right_inb=GP{} front=GP{} front_active={} tow_start={}"
         ).format(
             PROTOCOL_VERSION,
             BLE_UART_ID,
@@ -898,6 +1014,8 @@ class CartController:
             BLE_UART_RX,
             BLE_STATE_PIN,
             RIGHT_MOTOR_INB,
+            FRONT_OBSTACLE_PIN,
+            "low" if FRONT_OBSTACLE_ACTIVE_LOW else "high",
             bool_text(AUTO_MODE_ON_START),
         )
 
@@ -929,7 +1047,8 @@ class CommandInterface:
     def pins_line(self):
         return (
             "pins left_pwm=GP{} left_ina=GP{} left_inb=GP{} "
-            "right_pwm=GP{} right_ina=GP{} right_inb=GP{} estop=GP{} ble_state=GP{}"
+            "right_pwm=GP{} right_ina=GP{} right_inb=GP{} estop=GP{} "
+            "front=GP{} ble_state=GP{}"
         ).format(
             LEFT_MOTOR_PWM,
             LEFT_MOTOR_INA,
@@ -938,6 +1057,7 @@ class CommandInterface:
             RIGHT_MOTOR_INA,
             RIGHT_MOTOR_INB,
             ESTOP_PIN,
+            FRONT_OBSTACLE_PIN,
             BLE_STATE_PIN,
         )
 
@@ -990,10 +1110,16 @@ class CommandInterface:
 
         start = ticks_ms()
         while ticks_diff(ticks_ms(), start) < duration_ms:
+            self.controller.front_obstacle.update(ticks_ms())
             if self.controller.estop.value() == 0:
                 self.controller.left_motor.stop()
                 self.controller.right_motor.stop()
                 self.reply("err estop")
+                return
+            if self.controller.front_blocks_targets(left_target, right_target):
+                self.controller.left_motor.stop()
+                self.controller.right_motor.stop()
+                self.reply("err front_obstacle")
                 return
             self.controller.left_motor.ramp_to(left_target)
             self.controller.right_motor.ramp_to(right_target)
@@ -1099,8 +1225,10 @@ class CommandInterface:
             left = -power
             right = power
 
-        self.controller.set_manual_drive(left, right)
-        self.reply("ok drive left={:.2f} right={:.2f}".format(left, right))
+        if self.controller.set_manual_drive(left, right):
+            self.reply("ok drive left={:.2f} right={:.2f}".format(left, right))
+        else:
+            self.reply("err front_obstacle")
 
     def handle(self, line):
         print("ble_cmd={}".format(line))
@@ -1144,8 +1272,9 @@ class CommandInterface:
                 if not self.controller.sensor_ok:
                     self.controller.stop(MODE_IDLE)
                     self.reply("err sensor_not_ready")
+                elif not self.controller.enter_tow():
+                    self.reply("err front_obstacle")
                 else:
-                    self.controller.enter_tow()
                     self.reply("ok mode=tow")
             elif command == "manual" or command == "man":
                 self.controller.enter_manual()
@@ -1181,8 +1310,10 @@ class CommandInterface:
                     right = parse_power(parts[2])
                     left = clamp(left, -MANUAL_MAX_PWM, MANUAL_MAX_PWM)
                     right = clamp(right, -MANUAL_MAX_PWM, MANUAL_MAX_PWM)
-                    self.controller.set_manual_drive(left, right)
-                    self.reply("ok drive left={:.2f} right={:.2f}".format(left, right))
+                    if self.controller.set_manual_drive(left, right):
+                        self.reply("ok drive left={:.2f} right={:.2f}".format(left, right))
+                    else:
+                        self.reply("err front_obstacle")
             elif command in ("f", "b", "l", "r"):
                 if not ALLOW_BLE_MANUAL_DRIVE:
                     self.reply("err manual_disabled")
@@ -1198,7 +1329,7 @@ class CommandInterface:
             self.reply("err {}".format(err))
 
 
-def run_motor_test(left_motor, right_motor, led_mode):
+def run_motor_test(left_motor, right_motor, front_obstacle, led_mode):
     print("motor_test_mode=on")
     print("Keep both wheels lifted before testing.")
     sequence = (
@@ -1218,6 +1349,14 @@ def run_motor_test(left_motor, right_motor, led_mode):
             start = ticks_ms()
             while ticks_diff(ticks_ms(), start) < MOTOR_TEST_STEP_MS:
                 now = ticks_ms()
+                front_obstacle.update(now)
+                if (front_obstacle.blocked and
+                        (left_target > MOTOR_ZERO_EPSILON or
+                         right_target > MOTOR_ZERO_EPSILON)):
+                    left_motor.stop()
+                    right_motor.stop()
+                    print("motor_test_blocked=front_obstacle")
+                    break
                 led_mode.update(now)
                 left_motor.ramp_to(left_target)
                 right_motor.ramp_to(right_target)
@@ -1228,6 +1367,9 @@ def main():
     led = make_led()
     ble = BluetoothSerial()
     estop = Pin(ESTOP_PIN, Pin.IN, Pin.PULL_UP)
+    front_obstacle = FrontObstacleSensor(
+        Pin(FRONT_OBSTACLE_PIN, Pin.IN, Pin.PULL_UP)
+    )
 
     left_motor = Motor(
         LEFT_MOTOR_PWM,
@@ -1249,15 +1391,25 @@ def main():
         )
     )
     print("right_motor_inb=GP{} gp15_reserved_for_ble_state".format(RIGHT_MOTOR_INB))
+    print(
+        "front_obstacle=GP{} active={} clear_ms={}".format(
+            FRONT_OBSTACLE_PIN,
+            "low" if FRONT_OBSTACLE_ACTIVE_LOW else "high",
+            FRONT_OBSTACLE_CLEAR_MS,
+        )
+    )
 
     led_mode = StatusLed(led, ble)
 
     if MOTOR_TEST_MODE:
-        run_motor_test(left_motor, right_motor, led_mode)
+        run_motor_test(left_motor, right_motor, front_obstacle, led_mode)
 
     left_hx = HX711(LEFT_HX711_DOUT, LEFT_HX711_SCK)
     right_hx = HX711(RIGHT_HX711_DOUT, RIGHT_HX711_SCK)
-    controller = CartController(left_hx, right_hx, left_motor, right_motor, estop, ble)
+    controller = CartController(
+        left_hx, right_hx, left_motor, right_motor, estop, front_obstacle, ble
+    )
+    front_obstacle.attach_stop_callback(controller.front_obstacle_stop)
     led_mode.set_controller(controller)
     commands = CommandInterface(controller, ble, led_mode)
 
