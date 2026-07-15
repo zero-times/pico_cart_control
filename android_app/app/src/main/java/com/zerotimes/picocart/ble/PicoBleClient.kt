@@ -18,11 +18,13 @@ import android.content.pm.PackageManager
 import android.os.Build
 import androidx.core.content.ContextCompat
 import com.zerotimes.picocart.protocol.PicoProtocol
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
+import java.util.ArrayDeque
 import java.util.UUID
 
 data class BleDeviceItem(
@@ -59,7 +61,9 @@ class PicoBleClient(
         context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
     private val bluetoothAdapter: BluetoothAdapter? = bluetoothManager.adapter
     private val scanner get() = bluetoothAdapter?.bluetoothLeScanner
-    private val writeMutex = Mutex()
+    private val commandQueue = ArrayDeque<OutgoingCommand>()
+    private val commandQueueLock = Any()
+    private val writeWake = Channel<Unit>(Channel.CONFLATED)
 
     private var gatt: BluetoothGatt? = null
     private var connectedDevice: BleDeviceItem? = null
@@ -68,6 +72,15 @@ class PicoBleClient(
     private var writeNoResponse = false
     private var rxBuffer = ""
     private var discoveryStarted = false
+    @Volatile private var pendingWriteAck: CompletableDeferred<Int>? = null
+
+    init {
+        scope.launch {
+            for (ignored in writeWake) {
+                drainCommandQueue()
+            }
+        }
+    }
 
     val isBluetoothEnabled: Boolean
         get() = bluetoothAdapter?.isEnabled == true
@@ -155,6 +168,11 @@ class PicoBleClient(
     }
 
     fun close() {
+        synchronized(commandQueueLock) {
+            commandQueue.clear()
+        }
+        pendingWriteAck?.complete(BluetoothGatt.GATT_FAILURE)
+        pendingWriteAck = null
         runCatching { gatt?.close() }
         gatt = null
         writeCharacteristic = null
@@ -167,27 +185,38 @@ class PicoBleClient(
     fun sendCommand(command: String, logCommand: Boolean = true) {
         val trimmed = command.trim()
         if (trimmed.isEmpty()) return
-        scope.launch {
-            writeMutex.withLock {
-                val currentGatt = gatt ?: run {
-                    onEvent(BleEvent.Log("not connected"))
-                    return@withLock
+        val outgoing = OutgoingCommand(trimmed, logCommand, commandKind(trimmed))
+        synchronized(commandQueueLock) {
+            when (outgoing.kind) {
+                CommandKind.HARD_STOP -> {
+                    commandQueue.clear()
+                    commandQueue.addFirst(outgoing)
                 }
-                val characteristic = writeCharacteristic ?: run {
-                    onEvent(BleEvent.Log("write characteristic unavailable"))
-                    return@withLock
+                CommandKind.SOFT_STOP -> {
+                    removeQueuedMotionCommands()
+                    commandQueue.addFirst(outgoing)
                 }
-                val bytes = "$trimmed\n".toByteArray(Charsets.UTF_8)
-                if (logCommand) {
-                    onEvent(BleEvent.Log("> $trimmed"))
+                CommandKind.MOVEMENT -> {
+                    if (trimmed == "keepalive" && commandQueue.any { it.text == "keepalive" }) {
+                        return
+                    }
+                    if (trimmed != "keepalive") {
+                        removeQueuedMotionCommands()
+                    }
+                    commandQueue.addLast(outgoing)
                 }
-                bytes.asIterable().chunked(18).forEach { chunk ->
-                    val payload = chunk.map { it.toByte() }.toByteArray()
-                    writeChunk(currentGatt, characteristic, payload)
-                    delay(35)
+                CommandKind.REGULAR -> {
+                    if (trimmed == "status" && commandQueue.any { it.text == "status" }) {
+                        return
+                    }
+                    commandQueue.addLast(outgoing)
                 }
             }
         }
+        if (outgoing.kind == CommandKind.HARD_STOP) {
+            pendingWriteAck?.complete(BluetoothGatt.GATT_FAILURE)
+        }
+        writeWake.trySend(Unit)
     }
 
     private fun emitDevice(result: ScanResult) {
@@ -208,29 +237,132 @@ class PicoBleClient(
         )
     }
 
-    private fun writeChunk(
+    private suspend fun drainCommandQueue() {
+        while (true) {
+            val command = synchronized(commandQueueLock) {
+                if (commandQueue.isEmpty()) null else commandQueue.removeFirst()
+            } ?: return
+            writeCommand(command)
+        }
+    }
+
+    private suspend fun writeCommand(command: OutgoingCommand) {
+        val currentGatt = gatt ?: run {
+            onEvent(BleEvent.Log("not connected"))
+            return
+        }
+        val characteristic = writeCharacteristic ?: run {
+            onEvent(BleEvent.Log("write characteristic unavailable"))
+            return
+        }
+        if (command.logCommand) {
+            onEvent(BleEvent.Log("> ${command.text}"))
+        }
+        val bytes = "${command.text}\n".toByteArray(Charsets.UTF_8)
+        for (offset in bytes.indices step WRITE_CHUNK_BYTES) {
+            val end = minOf(offset + WRITE_CHUNK_BYTES, bytes.size)
+            val payload = bytes.copyOfRange(offset, end)
+            if (!writeChunk(currentGatt, characteristic, payload)) {
+                onEvent(BleEvent.Log("write failed command=${command.text}"))
+                return
+            }
+        }
+    }
+
+    private suspend fun writeChunk(
         currentGatt: BluetoothGatt,
         characteristic: BluetoothGattCharacteristic,
         payload: ByteArray,
-    ) {
+    ): Boolean {
         val writeType = if (writeNoResponse) {
             BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
         } else {
             BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
         }
-        val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            currentGatt.writeCharacteristic(characteristic, payload, writeType) == BluetoothGatt.GATT_SUCCESS
+
+        repeat(WRITE_ATTEMPTS) { attempt ->
+            if (writeNoResponse) {
+                if (startGattWrite(currentGatt, characteristic, payload, writeType)) {
+                    delay(NO_RESPONSE_WRITE_GAP_MS)
+                    return true
+                }
+            } else {
+                val ack = CompletableDeferred<Int>()
+                pendingWriteAck = ack
+                val accepted = startGattWrite(currentGatt, characteristic, payload, writeType)
+                if (accepted) {
+                    val status = withTimeoutOrNull(WRITE_ACK_TIMEOUT_MS) { ack.await() }
+                    if (status == BluetoothGatt.GATT_SUCCESS) {
+                        if (pendingWriteAck === ack) pendingWriteAck = null
+                        return true
+                    }
+                    if (status == null) {
+                        // Give a late callback a chance to drain before another write starts.
+                        delay(WRITE_CALLBACK_SETTLE_MS)
+                        if (pendingWriteAck === ack) pendingWriteAck = null
+                        return false
+                    }
+                    if (pendingWriteAck === ack) pendingWriteAck = null
+                } else if (pendingWriteAck === ack) {
+                    pendingWriteAck = null
+                }
+            }
+            if (hasQueuedHardStop()) return false
+            if (attempt < WRITE_ATTEMPTS - 1) {
+                delay(WRITE_RETRY_DELAY_MS)
+            }
+        }
+        return false
+    }
+
+    private fun startGattWrite(
+        currentGatt: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic,
+        payload: ByteArray,
+        writeType: Int,
+    ): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            currentGatt.writeCharacteristic(characteristic, payload, writeType) ==
+                BluetoothGatt.GATT_SUCCESS
         } else {
             characteristic.writeType = writeType
             characteristic.value = payload
             currentGatt.writeCharacteristic(characteristic)
         }
-        if (!ok) {
-            onEvent(BleEvent.Log("write failed"))
+    }
+
+    private fun removeQueuedMotionCommands() {
+        val iterator = commandQueue.iterator()
+        while (iterator.hasNext()) {
+            val kind = iterator.next().kind
+            if (kind == CommandKind.MOVEMENT || kind == CommandKind.SOFT_STOP) {
+                iterator.remove()
+            }
+        }
+    }
+
+    private fun hasQueuedHardStop(): Boolean = synchronized(commandQueueLock) {
+        commandQueue.any { it.kind == CommandKind.HARD_STOP }
+    }
+
+    private fun commandKind(command: String): CommandKind {
+        return when (command.substringBefore(' ').lowercase()) {
+            "stop", "s" -> CommandKind.HARD_STOP
+            "softstop" -> CommandKind.SOFT_STOP
+            "f", "b", "l", "r", "drive", "keepalive" -> CommandKind.MOVEMENT
+            else -> CommandKind.REGULAR
         }
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
+        override fun onCharacteristicWrite(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int,
+        ) {
+            pendingWriteAck?.complete(status)
+        }
+
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 onEvent(BleEvent.Error("connection status=$status"))
@@ -347,7 +479,7 @@ class PicoBleClient(
                     val score = PicoProtocol.uuidScore(service.uuid.toString(), PicoProtocol.serviceHints) +
                         PicoProtocol.uuidScore(writeChar.uuid.toString(), PicoProtocol.characteristicHints) +
                         PicoProtocol.uuidScore(notifyChar.uuid.toString(), PicoProtocol.characteristicHints) +
-                        (if (writeChar.properties hasAny BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) 8 else 0) +
+                        (if (writeChar.properties hasAny BluetoothGattCharacteristic.PROPERTY_WRITE) 8 else 0) +
                         (if (notifyChar.properties hasAny BluetoothGattCharacteristic.PROPERTY_NOTIFY) 8 else 0)
                     if (best == null || score > best!!.score) {
                         best = ChannelSelection(
@@ -358,8 +490,11 @@ class PicoBleClient(
                                 serviceId = service.uuid.toString(),
                                 writeCharId = writeChar.uuid.toString(),
                                 notifyCharId = notifyChar.uuid.toString(),
-                                writeNoResponse = writeChar.properties hasAny
-                                    BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE,
+                                writeNoResponse =
+                                    (writeChar.properties hasAny
+                                        BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) &&
+                                        !(writeChar.properties hasAny
+                                            BluetoothGattCharacteristic.PROPERTY_WRITE),
                             ),
                         )
                     }
@@ -376,6 +511,19 @@ class PicoBleClient(
         val channel: BleChannel,
     )
 
+    private data class OutgoingCommand(
+        val text: String,
+        val logCommand: Boolean,
+        val kind: CommandKind,
+    )
+
+    private enum class CommandKind {
+        HARD_STOP,
+        SOFT_STOP,
+        MOVEMENT,
+        REGULAR,
+    }
+
     private infix fun Int.hasAny(mask: Int): Boolean = this and mask != 0
 
     private companion object {
@@ -386,5 +534,11 @@ class PicoBleClient(
         const val NOTIFY_PROPERTIES: Int =
             BluetoothGattCharacteristic.PROPERTY_NOTIFY or
                 BluetoothGattCharacteristic.PROPERTY_INDICATE
+        const val WRITE_CHUNK_BYTES = 18
+        const val WRITE_ATTEMPTS = 3
+        const val WRITE_ACK_TIMEOUT_MS = 1_200L
+        const val WRITE_CALLBACK_SETTLE_MS = 250L
+        const val WRITE_RETRY_DELAY_MS = 60L
+        const val NO_RESPONSE_WRITE_GAP_MS = 35L
     }
 }

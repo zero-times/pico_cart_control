@@ -31,7 +31,10 @@ object PicoProtocol {
         "full_raw",
         "steer_gain",
         "ramp",
+        "decel_ramp",
         "manual_max",
+        "timeout_ms",
+        "reverse_neutral_ms",
         "left_motor_gain",
         "right_motor_gain",
         "left_force_gain",
@@ -46,8 +49,11 @@ object PicoProtocol {
         "start_raw" to "25000",
         "full_raw" to "180000",
         "steer_gain" to "0.75",
-        "ramp" to "0.018",
+        "ramp" to "0.012",
+        "decel_ramp" to "0.018",
         "manual_max" to "0.25",
+        "timeout_ms" to "1200",
+        "reverse_neutral_ms" to "120",
         "left_motor_gain" to "1.00",
         "right_motor_gain" to "1.00",
         "left_force_gain" to "1.00",
@@ -57,6 +63,10 @@ object PicoProtocol {
     )
 
     fun parameterLabel(key: String): String = when (key) {
+        "ramp" -> "启动斜坡（每 25ms PWM 增量）"
+        "decel_ramp" -> "停车斜坡（每 25ms PWM 减量）"
+        "timeout_ms" -> "手动控制保活超时（毫秒）"
+        "reverse_neutral_ms" -> "反向零位等待（毫秒）"
         "tow_left_comp" -> "牵引左通道补偿（原始拉力）"
         "tow_right_comp" -> "牵引右通道补偿（原始拉力）"
         else -> key

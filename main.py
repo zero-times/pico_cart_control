@@ -31,7 +31,7 @@ BLE_UART_BAUD = 115200
 BLE_STATE_PIN = 15
 BLE_STATE_ACTIVE_HIGH = True
 BLE_LINE_MAX = 160
-PROTOCOL_VERSION = "pico-cart-ble-2026-07-04"
+PROTOCOL_VERSION = "pico-cart-ble-2026-07-15"
 
 # HX711 modules. Each S-type load cell uses one HX711.
 LEFT_HX711_DOUT = 6
@@ -107,8 +107,10 @@ RIGHT_MOTOR_REVERSE = False
 LEFT_MOTOR_GAIN = 1.0
 RIGHT_MOTOR_GAIN = 1.0
 
-# Output smoothing. Bigger = faster start/stop.
-RAMP_STEP = 0.018
+# Output smoothing, expressed as the PWM delta per nominal LOOP_MS.
+# Actual slew is compensated with elapsed time so sensor delays do not distort it.
+RAMP_STEP = 0.012
+DECEL_RAMP_STEP = 0.018
 LOOP_MS = 25
 
 # Low-pass filter for load-cell readings.
@@ -127,7 +129,9 @@ BLE_STREAM_EVERY_MS = 500
 # Bluetooth manual-drive mode is intentionally limited and times out quickly.
 ALLOW_BLE_MANUAL_DRIVE = True
 MANUAL_MAX_PWM = 0.25
-MANUAL_TIMEOUT_MS = 700
+MANUAL_TIMEOUT_MS = 1200
+REVERSE_NEUTRAL_MS = 120
+MOTOR_ZERO_EPSILON = 0.002
 
 # Set True when you only want to test the motor driver without HX711 sensors.
 MOTOR_TEST_MODE = False
@@ -431,6 +435,7 @@ class Motor:
         self.inb = Pin(inb_pin, Pin.OUT)
         self.reverse = reverse
         self.current = 0.0
+        self.last_update_ms = ticks_ms()
         self.write(0.0)
 
     def write(self, command):
@@ -451,18 +456,31 @@ class Motor:
 
         self.pwm.duty_u16(int(clamp(duty, 0.0, 1.0) * 65535))
 
-    def ramp_to(self, target):
+    def ramp_to(self, target, now=None):
         target = clamp(target, -MAX_PWM, MAX_PWM)
-        if target > self.current + RAMP_STEP:
-            self.current += RAMP_STEP
-        elif target < self.current - RAMP_STEP:
-            self.current -= RAMP_STEP
+        now = ticks_ms() if now is None else now
+        elapsed_ms = ticks_diff(now, self.last_update_ms)
+        self.last_update_ms = now
+        elapsed_ms = clamp(elapsed_ms, 1, 200)
+
+        accelerating = (
+            self.current == 0.0
+            or (self.current * target >= 0.0 and abs(target) > abs(self.current))
+        )
+        step_per_loop = RAMP_STEP if accelerating else DECEL_RAMP_STEP
+        max_delta = step_per_loop * elapsed_ms / LOOP_MS
+
+        if target > self.current + max_delta:
+            self.current += max_delta
+        elif target < self.current - max_delta:
+            self.current -= max_delta
         else:
             self.current = target
         self.write(self.current)
 
     def stop(self):
         self.current = 0.0
+        self.last_update_ms = ticks_ms()
         self.write(0.0)
 
 
@@ -517,8 +535,14 @@ class CartController:
 
         self.manual_left = 0.0
         self.manual_right = 0.0
+        self.pending_manual_left = 0.0
+        self.pending_manual_right = 0.0
         self.last_manual_ms = ticks_ms()
         self.drive_status = "idle"
+        self.reverse_state = ""
+        self.reverse_neutral_started_ms = 0
+        self.soft_stop_pending = False
+        self.soft_stop_reason = ""
         self.tow_armed = False
         self.tow_baseline_started_ms = 0
         self.tow_left_baseline = 0.0
@@ -530,7 +554,12 @@ class CartController:
         self.mode = mode
         self.manual_left = 0.0
         self.manual_right = 0.0
+        self.pending_manual_left = 0.0
+        self.pending_manual_right = 0.0
         self.drive_status = "idle"
+        self.reverse_state = ""
+        self.soft_stop_pending = False
+        self.soft_stop_reason = ""
         self.tow_armed = False
         self.tow_left_force = 0.0
         self.tow_right_force = 0.0
@@ -604,17 +633,69 @@ class CartController:
     def set_manual_drive(self, left, right):
         left = clamp(left, -MANUAL_MAX_PWM, MANUAL_MAX_PWM)
         right = clamp(right, -MANUAL_MAX_PWM, MANUAL_MAX_PWM)
+        now = ticks_ms()
         self.mode = MODE_MANUAL
-        self.manual_left = left
-        self.manual_right = right
-        self.drive_status = "active"
+        self.last_manual_ms = now
+        self.soft_stop_pending = False
+        self.soft_stop_reason = ""
+
+        reversing = (
+            self.direction_reverses(self.left_motor.current, left)
+            or self.direction_reverses(self.right_motor.current, right)
+        )
+        if reversing:
+            self.pending_manual_left = left
+            self.pending_manual_right = right
+            self.manual_left = 0.0
+            self.manual_right = 0.0
+            self.reverse_state = "braking"
+            self.drive_status = "reverse_braking"
+        else:
+            self.manual_left = left
+            self.manual_right = right
+            self.pending_manual_left = 0.0
+            self.pending_manual_right = 0.0
+            self.reverse_state = ""
+            self.drive_status = "active"
+
+    def direction_reverses(self, current, target):
+        return (
+            (current > MOTOR_ZERO_EPSILON and target < -MOTOR_ZERO_EPSILON)
+            or (current < -MOTOR_ZERO_EPSILON and target > MOTOR_ZERO_EPSILON)
+        )
+
+    def refresh_manual_lease(self):
+        if self.mode != MODE_MANUAL or self.soft_stop_pending:
+            return False
         self.last_manual_ms = ticks_ms()
+        return True
+
+    def soft_stop(self, reason="soft_stop"):
+        self.manual_left = 0.0
+        self.manual_right = 0.0
+        self.pending_manual_left = 0.0
+        self.pending_manual_right = 0.0
+        self.reverse_state = ""
+        self.soft_stop_pending = True
+        self.soft_stop_reason = reason
+        self.drive_status = reason
+
+    def motors_stopped(self):
+        return (
+            abs(self.left_motor.current) <= MOTOR_ZERO_EPSILON
+            and abs(self.right_motor.current) <= MOTOR_ZERO_EPSILON
+        )
 
     def enter_manual(self):
         self.mode = MODE_MANUAL
         self.manual_left = 0.0
         self.manual_right = 0.0
+        self.pending_manual_left = 0.0
+        self.pending_manual_right = 0.0
         self.drive_status = "active"
+        self.reverse_state = ""
+        self.soft_stop_pending = False
+        self.soft_stop_reason = ""
         self.last_manual_ms = ticks_ms()
 
     def enter_tow(self):
@@ -640,6 +721,7 @@ class CartController:
 
     def update(self, now):
         self.read_sensors()
+        now = ticks_ms()
         self.unsafe_reason = self.safety_reason()
 
         if self.unsafe_reason:
@@ -647,8 +729,8 @@ class CartController:
             self.manual_right = 0.0
             self.tow_armed = False
             self.drive_status = "idle"
-            self.left_motor.ramp_to(0.0)
-            self.right_motor.ramp_to(0.0)
+            self.left_motor.ramp_to(0.0, now)
+            self.right_motor.ramp_to(0.0, now)
             return
 
         if self.mode == MODE_IDLE:
@@ -658,13 +740,36 @@ class CartController:
             self.steer = 0.0
             self.drive_status = "idle"
         elif self.mode == MODE_MANUAL:
-            if ticks_diff(now, self.last_manual_ms) > MANUAL_TIMEOUT_MS:
-                # Dead-man stop: expected watchdog, not a hardware fault.
-                self.manual_left = 0.0
-                self.manual_right = 0.0
+            if (not self.soft_stop_pending and
+                    ticks_diff(now, self.last_manual_ms) > MANUAL_TIMEOUT_MS):
+                # Dead-man expiry is a controlled stop, not a hardware fault.
+                self.soft_stop("timeout")
+
+            if self.reverse_state == "braking":
                 left_target = 0.0
                 right_target = 0.0
-                self.drive_status = "timeout"
+                self.drive_status = "reverse_braking"
+                if self.motors_stopped():
+                    self.reverse_state = "neutral"
+                    self.reverse_neutral_started_ms = now
+                    self.drive_status = "reverse_neutral"
+            elif self.reverse_state == "neutral":
+                left_target = 0.0
+                right_target = 0.0
+                self.drive_status = "reverse_neutral"
+                if ticks_diff(now, self.reverse_neutral_started_ms) >= REVERSE_NEUTRAL_MS:
+                    self.manual_left = self.pending_manual_left
+                    self.manual_right = self.pending_manual_right
+                    self.pending_manual_left = 0.0
+                    self.pending_manual_right = 0.0
+                    self.reverse_state = ""
+                    left_target = self.manual_left
+                    right_target = self.manual_right
+                    self.drive_status = "active"
+            elif self.soft_stop_pending:
+                left_target = 0.0
+                right_target = 0.0
+                self.drive_status = self.soft_stop_reason
             else:
                 left_target = self.manual_left
                 right_target = self.manual_right
@@ -714,15 +819,19 @@ class CartController:
                     self.steer = 0.0
                     self.drive_status = "idle"
 
-        self.left_motor.ramp_to(left_target * LEFT_MOTOR_GAIN)
-        self.right_motor.ramp_to(right_target * RIGHT_MOTOR_GAIN)
+        self.left_motor.ramp_to(left_target * LEFT_MOTOR_GAIN, now)
+        self.right_motor.ramp_to(right_target * RIGHT_MOTOR_GAIN, now)
+
+        if self.mode == MODE_MANUAL and self.soft_stop_pending and self.motors_stopped():
+            self.mode = MODE_IDLE
+            self.drive_status = self.soft_stop_reason
 
     def status_line(self):
         return (
             "stat mode={} sensor={} err={} lraw={:.0f} rraw={:.0f} l={:.0f} r={:.0f} "
             "ltow={:.0f} rtow={:.0f} lbase={:.0f} rbase={:.0f} "
-            "total={:.0f} steer={:.2f} pwml={:.2f} pwmr={:.2f} estop={} bt={} "
-            "unsafe={} drive={}"
+            "total={:.0f} steer={:.2f} targetl={:.2f} targetr={:.2f} "
+            "pwml={:.2f} pwmr={:.2f} age_ms={} estop={} bt={} unsafe={} drive={}"
         ).format(
             self.mode,
             "ok" if self.sensor_ok else "bad",
@@ -737,8 +846,11 @@ class CartController:
             self.tow_right_baseline,
             self.total,
             self.steer,
+            self.manual_left,
+            self.manual_right,
             self.left_motor.current,
             self.right_motor.current,
+            max(0, ticks_diff(ticks_ms(), self.last_manual_ms)) if self.mode == MODE_MANUAL else 0,
             self.estop.value(),
             self.ble.connected(),
             self.unsafe_reason or "-",
@@ -748,7 +860,8 @@ class CartController:
     def param_line(self):
         return (
             "param max_pwm={:.2f} min_pwm={:.2f} start_raw={} full_raw={} "
-            "steer_gain={:.2f} ramp={:.3f} manual_max={:.2f} timeout_ms={} "
+            "steer_gain={:.2f} ramp={:.3f} decel_ramp={:.3f} manual_max={:.2f} "
+            "timeout_ms={} reverse_neutral_ms={} "
             "left_motor_gain={:.2f} right_motor_gain={:.2f} "
             "left_force_gain={:.2f} right_force_gain={:.2f} "
             "tow_left_comp={} tow_right_comp={} "
@@ -760,8 +873,10 @@ class CartController:
             PULL_FULL_RAW,
             STEER_GAIN,
             RAMP_STEP,
+            DECEL_RAMP_STEP,
             MANUAL_MAX_PWM,
             MANUAL_TIMEOUT_MS,
+            REVERSE_NEUTRAL_MS,
             LEFT_MOTOR_GAIN,
             RIGHT_MOTOR_GAIN,
             LEFT_FORCE_GAIN,
@@ -805,10 +920,10 @@ class CommandInterface:
 
     def help(self):
         self.reply(
-            "help cmd: ver info pins status param stream on|off identify [S] tow auto manual idle stop tare drive L R f [P] b [P] l [P] r [P] motor SIDE DIR [P] [MS] set NAME VALUE"
+            "help cmd: ver info pins status param stream on|off identify [S] tow auto manual idle stop softstop keepalive tare drive L R f [P] b [P] l [P] r [P] motor SIDE DIR [P] [MS] set NAME VALUE"
         )
         self.reply(
-            "help set: max_pwm min_pwm start_raw full_raw steer_gain ramp manual_max left_motor_gain right_motor_gain left_force_gain right_force_gain tow_left_comp tow_right_comp"
+            "help set: max_pwm min_pwm start_raw full_raw steer_gain ramp decel_ramp manual_max timeout_ms reverse_neutral_ms left_motor_gain right_motor_gain left_force_gain right_force_gain tow_left_comp tow_right_comp"
         )
 
     def pins_line(self):
@@ -891,7 +1006,8 @@ class CommandInterface:
 
     def handle_set(self, parts):
         global MAX_PWM, MIN_MOVE_PWM, PULL_START_RAW, PULL_FULL_RAW
-        global STEER_GAIN, RAMP_STEP, MANUAL_MAX_PWM
+        global STEER_GAIN, RAMP_STEP, DECEL_RAMP_STEP, MANUAL_MAX_PWM
+        global MANUAL_TIMEOUT_MS, REVERSE_NEUTRAL_MS
         global LEFT_MOTOR_GAIN, RIGHT_MOTOR_GAIN, LEFT_FORCE_GAIN, RIGHT_FORCE_GAIN
         global TOW_LEFT_COMP_RAW, TOW_RIGHT_COMP_RAW
 
@@ -925,9 +1041,18 @@ class CommandInterface:
         elif name == "ramp":
             RAMP_STEP = clamp(value, 0.001, 0.08)
             stored = RAMP_STEP
+        elif name == "decel_ramp":
+            DECEL_RAMP_STEP = clamp(value, 0.001, 0.10)
+            stored = DECEL_RAMP_STEP
         elif name == "manual_max":
             MANUAL_MAX_PWM = clamp(value, 0.05, MAX_PWM)
             stored = MANUAL_MAX_PWM
+        elif name == "timeout_ms":
+            MANUAL_TIMEOUT_MS = int(clamp(value, 500, 5000))
+            stored = MANUAL_TIMEOUT_MS
+        elif name == "reverse_neutral_ms":
+            REVERSE_NEUTRAL_MS = int(clamp(value, 50, 1000))
+            stored = REVERSE_NEUTRAL_MS
         elif name == "left_motor_gain":
             LEFT_MOTOR_GAIN = clamp(value, 0.50, 1.20)
             stored = LEFT_MOTOR_GAIN
@@ -1031,6 +1156,17 @@ class CommandInterface:
             elif command == "stop" or command == "s":
                 self.controller.stop(MODE_IDLE)
                 self.reply("ok stop")
+            elif command == "softstop":
+                if self.controller.mode == MODE_MANUAL:
+                    self.controller.soft_stop()
+                else:
+                    self.controller.stop(MODE_IDLE)
+                self.reply("ok softstop")
+            elif command == "keepalive":
+                # Intentionally no success reply: this high-rate lease refresh must
+                # not compete with status notifications on the UART bridge.
+                if not self.controller.refresh_manual_lease():
+                    self.reply("err keepalive_inactive")
             elif command == "tare":
                 ok = self.controller.tare_sensors()
                 self.controller.stop(MODE_IDLE)
@@ -1130,7 +1266,7 @@ def main():
     controller.tare_sensors()
     controller.stop(MODE_IDLE)
     print(
-        "ble_commands: help pins status identify stream on|off tow auto manual stop tare drive L R f b l r motor set"
+        "ble_commands: help pins status identify stream on|off tow auto manual stop softstop keepalive tare drive L R f b l r motor set"
     )
 
     last_debug = ticks_ms()

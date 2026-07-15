@@ -107,10 +107,14 @@ data class CartUiState(
             "rbase" to "0",
             "total" to "0",
             "steer" to "0",
+            "targetl" to "0",
+            "targetr" to "0",
             "pwml" to "0",
             "pwmr" to "0",
+            "age_ms" to "0",
             "estop" to "-",
             "unsafe" to "-",
+            "drive" to "idle",
         )
     }
 }
@@ -170,9 +174,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     "reverse" -> "b ${speedForLevel(speedLevel)}"
                     else -> return false
                 }
-                if (!sendCommandForAgent(command)) return false
-                delay(durationMs.toLong())
-                return sendCommandForAgent("stop")
+                return runTimedManualCommand(command, durationMs)
             }
 
             override suspend fun turn(direction: String, speedLevel: Int, durationMs: Int): Boolean {
@@ -181,9 +183,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     "right" -> "r ${turnSpeedForLevel(speedLevel)}"
                     else -> return false
                 }
-                if (!sendCommandForAgent(command)) return false
-                delay(durationMs.toLong())
-                return sendCommandForAgent("stop")
+                return runTimedManualCommand(command, durationMs)
             }
         },
     )
@@ -290,8 +290,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         releaseDrive(sendStop = false)
         if (!sendCommand(command)) return
         driveJob = viewModelScope.launch {
-            while (isActive && sendCommand(command)) {
-                delay(260)
+            while (isActive) {
+                delay(MANUAL_KEEPALIVE_INTERVAL_MS)
+                if (!sendCommand("keepalive", logCommand = false)) break
             }
         }
     }
@@ -300,7 +301,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         driveJob?.cancel()
         driveJob = null
         if (sendStop && _uiState.value.connected) {
-            sendCommand("stop")
+            sendCommand("softstop")
         }
     }
 
@@ -328,14 +329,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun sendCommand(command: String): Boolean {
+    fun sendCommand(command: String, logCommand: Boolean = true): Boolean {
         val error = cartConnectionError()
         if (error != null) {
             lastHardwareOperationError = error
             addLog("command blocked: $error")
             return false
         }
-        client.sendCommand(command)
+        client.sendCommand(command, logCommand)
         return true
     }
 
@@ -791,6 +792,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         return sendCommand(command)
     }
 
+    private suspend fun runTimedManualCommand(command: String, durationMs: Int): Boolean {
+        if (!sendCommandForAgent(command)) return false
+        val endAt = SystemClock.elapsedRealtime() + durationMs.coerceAtLeast(0)
+        while (true) {
+            val remaining = endAt - SystemClock.elapsedRealtime()
+            if (remaining <= 0L) break
+            delay(minOf(MANUAL_KEEPALIVE_INTERVAL_MS, remaining))
+            if (SystemClock.elapsedRealtime() < endAt &&
+                !sendCommand("keepalive", logCommand = false)
+            ) {
+                return false
+            }
+        }
+        return sendCommandForAgent("softstop")
+    }
+
     private suspend fun requestFreshStatusForAgent(): CartStatus? {
         val heartbeatBeforeRequest = lastHeartbeatElapsedMs
         if (!sendCommandForAgent("status")) return null
@@ -914,6 +931,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         const val HEARTBEAT_INTERVAL_MS = 2_000L
         const val HEARTBEAT_TIMEOUT_MS = 4_500L
         const val HEARTBEAT_RESPONSE_TIMEOUT_MS = 900L
+        const val MANUAL_KEEPALIVE_INTERVAL_MS = 250L
         val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.US)
         val fileTimeFormat = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
         val LOCAL_STOP_COMMANDS = setOf("停车", "急停", "取消")
