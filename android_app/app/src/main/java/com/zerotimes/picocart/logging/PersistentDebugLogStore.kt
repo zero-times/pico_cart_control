@@ -36,6 +36,10 @@ internal class PersistentDebugLogStore(context: Context) {
         append(appLogFile, "app", message)
     }
 
+    fun appendHardware(message: String) {
+        append(appLogFile, "hardware", message)
+    }
+
     fun appendAgent(role: String, message: String, ok: Boolean?) {
         val status = ok?.let { if (it) " ok=1" else " ok=0" }.orEmpty()
         append(appLogFile, "agent/$role", "$message$status")

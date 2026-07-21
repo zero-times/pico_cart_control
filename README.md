@@ -177,6 +177,9 @@ status
 param
 stream on
 stream off
+hwlog dump
+hwlog status
+hwlog clear
 identify 5
 auto
 manual
@@ -530,6 +533,28 @@ adb shell tail -n 120 /sdcard/Android/data/com.zerotimes.picocart/files/logs/pic
 ```
 
 每个日志文件超过约 `2MB` 会自动轮转，保留 `.1`、`.2`、`.3` 三份历史文件。
+
+### Pico 硬件诊断日志
+
+Pico 会在 RAM 中维护最近 `192` 条硬件诊断记录，不会在行驶过程中写 Flash。
+进入 Android App 的 `调试` 页，连接并收到 Pico 心跳后，点击 `导出硬件日志`；App 会发送
+`hwlog dump`，Pico 通过 BLE UART 逐条回传，Android 会以 `[hardware]` 分类追加到同一份
+`pico_cart_debug.log` 中。导出进度只显示在界面，不会把整批记录刷进命令日志。
+
+Pico 端也支持直接发送：
+
+```text
+hwlog status    # 查看缓存条数和导出状态
+hwlog dump      # 开始 BLE 分批回传
+hwlog clear     # 清空 RAM 环形缓存
+```
+
+记录包含蓝牙连接/断开、命令、手动保活超时、HX711 左右读取异常与恢复、急停/障碍/传感器
+安全停车、模式切换、软停止和每 250ms 的运行快照。发生“突然停止”后，可同时拉取 App 日志：
+
+```bash
+adb pull /sdcard/Android/data/com.zerotimes.picocart/files/logs/pico_cart_debug.log .
+```
 
 ## Android Agent Host V1
 

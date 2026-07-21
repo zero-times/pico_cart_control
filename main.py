@@ -143,6 +143,14 @@ MOTOR_ZERO_EPSILON = 0.002
 # Keep the obstacle latched until the signal has remained clear for this long.
 FRONT_OBSTACLE_CLEAR_MS = 400
 
+# Hardware diagnostics stay in RAM so a driving cart never blocks on Pico flash
+# writes. The Android app can request the ring buffer through the BLE UART.
+HARDWARE_LOG_CAPACITY = 192
+HARDWARE_LOG_SNAPSHOT_MS = 250
+HARDWARE_LOG_OVERRUN_MS = 100
+HARDWARE_LOG_OVERRUN_REPEAT_MS = 1000
+HARDWARE_LOG_MAX_RECORD_CHARS = 124
+
 # Set True when you only want to test the motor driver without HX711 sensors.
 MOTOR_TEST_MODE = False
 MOTOR_TEST_PWM = 0.20
@@ -544,6 +552,106 @@ class FrontObstacleSensor:
         return self.blocked
 
 
+class HardwareLogger:
+    def __init__(self):
+        self.records = [None] * HARDWARE_LOG_CAPACITY
+        self.head = 0
+        self.count = 0
+        self.sequence = 1
+        self.last_snapshot_ms = ticks_ms()
+        self.last_state = ""
+        self.last_overrun_ms = 0
+        self.export_records = None
+        self.export_index = 0
+
+    def event(self, event, fields="", now=None):
+        now = ticks_ms() if now is None else now
+        record = "s={} t={} e={}".format(self.sequence, now, event)
+        if fields:
+            record += " " + fields.replace("\r", "_").replace("\n", "_")
+        record = record[:HARDWARE_LOG_MAX_RECORD_CHARS]
+        self.records[self.head] = record
+        self.head = (self.head + 1) % HARDWARE_LOG_CAPACITY
+        self.count = min(self.count + 1, HARDWARE_LOG_CAPACITY)
+        self.sequence += 1
+
+    def observe(self, controller, now):
+        state_fields = (
+            "mode={} drive={} sensor={} err={} unsafe={} tow={} bt={} front={}"
+        ).format(
+            controller.mode,
+            controller.drive_status,
+            "ok" if controller.sensor_ok else "bad",
+            controller.sensor_error or "-",
+            controller.unsafe_reason or "-",
+            bool_text(controller.tow_armed),
+            controller.ble.connected(),
+            bool_text(controller.front_obstacle.blocked),
+        )
+        snapshot_fields = (
+            "mode={} drive={} sensor={} err={} unsafe={} tow={} bt={} front={} "
+            "l={:.0f} r={:.0f} pl={:.2f} pr={:.2f} age={} loop={}"
+        ).format(
+            controller.mode,
+            controller.drive_status,
+            "ok" if controller.sensor_ok else "bad",
+            controller.sensor_error or "-",
+            controller.unsafe_reason or "-",
+            bool_text(controller.tow_armed),
+            controller.ble.connected(),
+            bool_text(controller.front_obstacle.blocked),
+            controller.left_force,
+            controller.right_force,
+            controller.left_motor.current,
+            controller.right_motor.current,
+            max(0, ticks_diff(now, controller.last_manual_ms))
+            if controller.mode == MODE_MANUAL else 0,
+            controller.last_loop_ms,
+        )
+        if state_fields != self.last_state:
+            self.last_state = state_fields
+            self.event("state", state_fields, now)
+        if ticks_diff(now, self.last_snapshot_ms) >= HARDWARE_LOG_SNAPSHOT_MS:
+            self.last_snapshot_ms = now
+            self.event("snap", snapshot_fields, now)
+
+    def record_loop_time(self, elapsed_ms, now):
+        if (elapsed_ms >= HARDWARE_LOG_OVERRUN_MS and
+                ticks_diff(now, self.last_overrun_ms) >= HARDWARE_LOG_OVERRUN_REPEAT_MS):
+            self.last_overrun_ms = now
+            self.event("loop_overrun", "ms={}".format(elapsed_ms), now)
+
+    def begin_export(self):
+        self.event("hwlog_dump", "n={}".format(self.count))
+        start = (self.head - self.count) % HARDWARE_LOG_CAPACITY
+        self.export_records = [
+            self.records[(start + index) % HARDWARE_LOG_CAPACITY]
+            for index in range(self.count)
+        ]
+        self.export_index = 0
+        return len(self.export_records)
+
+    def clear(self):
+        self.records = [None] * HARDWARE_LOG_CAPACITY
+        self.head = 0
+        self.count = 0
+        self.export_records = None
+        self.export_index = 0
+        self.event("hwlog_clear")
+
+    def next_export_line(self):
+        if self.export_records is None:
+            return None
+        total = len(self.export_records)
+        if self.export_index < total:
+            self.export_index += 1
+            record = self.export_records[self.export_index - 1]
+            return "hwlog i={} n={} {}".format(self.export_index, total, record)
+        self.export_records = None
+        self.export_index = 0
+        return "hwlog_end n={}".format(total)
+
+
 def safe_force(raw, sign):
     force = raw * sign
     if force < 0:
@@ -574,7 +682,8 @@ def compute_targets(left_force, right_force):
 
 class CartController:
     def __init__(
-        self, left_hx, right_hx, left_motor, right_motor, estop, front_obstacle, ble
+        self, left_hx, right_hx, left_motor, right_motor, estop, front_obstacle, ble,
+        hardware_log
     ):
         self.left_hx = left_hx
         self.right_hx = right_hx
@@ -583,6 +692,7 @@ class CartController:
         self.estop = estop
         self.front_obstacle = front_obstacle
         self.ble = ble
+        self.hardware_log = hardware_log
 
         self.mode = MODE_AUTO if AUTO_MODE_ON_START else MODE_IDLE
         self.tared = False
@@ -595,6 +705,8 @@ class CartController:
         self.total = 0.0
         self.steer = 0.0
         self.unsafe_reason = ""
+        self.last_unsafe_reason = ""
+        self.last_loop_ms = 0
 
         self.manual_left = 0.0
         self.manual_right = 0.0
@@ -613,7 +725,7 @@ class CartController:
         self.tow_left_force = 0.0
         self.tow_right_force = 0.0
 
-    def stop(self, mode=MODE_IDLE):
+    def stop(self, mode=MODE_IDLE, reason="stop"):
         self.mode = mode
         self.manual_left = 0.0
         self.manual_right = 0.0
@@ -628,6 +740,7 @@ class CartController:
         self.tow_right_force = 0.0
         self.left_motor.stop()
         self.right_motor.stop()
+        self.hardware_log.event("stop", "reason={} mode={}".format(reason, mode))
 
     def front_obstacle_stop(self):
         # Never preserve a forward target across an obstacle event. Manual mode
@@ -645,6 +758,7 @@ class CartController:
         self.drive_status = "front_obstacle"
         self.left_motor.stop()
         self.right_motor.stop()
+        self.hardware_log.event("stop", "reason=front_obstacle")
 
     def front_blocks_targets(self, left, right):
         return self.front_obstacle.blocked and (
@@ -657,12 +771,14 @@ class CartController:
         self.tared = False
         self.sensor_ok = False
         self.sensor_error = "taring"
+        self.hardware_log.event("tare_start", "samples={}".format(samples))
         print("tare_start")
         try:
             left_offset = self.left_hx.tare(samples)
             right_offset = self.right_hx.tare(samples)
         except OSError as err:
             self.sensor_error = str(err)
+            self.hardware_log.event("tare_error", "err={}".format(self.sensor_error))
             print("tare_error={}".format(self.sensor_error))
             return False
 
@@ -675,6 +791,7 @@ class CartController:
         self.tared = True
         self.sensor_ok = True
         self.sensor_error = ""
+        self.hardware_log.event("tare_ok")
         print("tare_left={}, tare_right={}".format(left_offset, right_offset))
         return True
 
@@ -684,12 +801,24 @@ class CartController:
             self.sensor_error = "not_tared"
             return False
 
+        was_sensor_ok = self.sensor_ok
+        previous_error = self.sensor_error
         try:
             raw_left = self.left_hx.read_tared()
+        except OSError as err:
+            self.sensor_ok = False
+            self.sensor_error = "left_{}".format(str(err).replace(" ", "_"))
+            if was_sensor_ok or self.sensor_error != previous_error:
+                self.hardware_log.event("hx_error", "side=left err={}".format(self.sensor_error))
+            return False
+
+        try:
             raw_right = self.right_hx.read_tared()
         except OSError as err:
             self.sensor_ok = False
-            self.sensor_error = str(err)
+            self.sensor_error = "right_{}".format(str(err).replace(" ", "_"))
+            if was_sensor_ok or self.sensor_error != previous_error:
+                self.hardware_log.event("hx_error", "side=right err={}".format(self.sensor_error))
             return False
 
         self.left_filtered = (
@@ -702,6 +831,8 @@ class CartController:
         self.right_force = safe_force(self.right_filtered, RIGHT_FORCE_SIGN) * RIGHT_FORCE_GAIN
         self.sensor_ok = True
         self.sensor_error = ""
+        if not was_sensor_ok:
+            self.hardware_log.event("sensor_recovered")
         return True
 
     def safety_reason(self):
@@ -720,6 +851,7 @@ class CartController:
         right = clamp(right, -MANUAL_MAX_PWM, MANUAL_MAX_PWM)
         if self.front_blocks_targets(left, right):
             self.front_obstacle_stop()
+            self.hardware_log.event("drive_rejected", "reason=front_obstacle")
             return False
         now = ticks_ms()
         self.mode = MODE_MANUAL
@@ -745,6 +877,7 @@ class CartController:
             self.pending_manual_right = 0.0
             self.reverse_state = ""
             self.drive_status = "active"
+        self.hardware_log.event("drive_command", "l={:.2f} r={:.2f}".format(left, right))
         return True
 
     def direction_reverses(self, current, target):
@@ -768,6 +901,7 @@ class CartController:
         self.soft_stop_pending = True
         self.soft_stop_reason = reason
         self.drive_status = reason
+        self.hardware_log.event("soft_stop", "reason={}".format(reason))
 
     def motors_stopped(self):
         return (
@@ -786,10 +920,11 @@ class CartController:
         self.soft_stop_pending = False
         self.soft_stop_reason = ""
         self.last_manual_ms = ticks_ms()
+        self.hardware_log.event("mode", "to=manual")
 
     def enter_tow(self):
         if self.front_obstacle.blocked:
-            self.stop(MODE_IDLE)
+            self.stop(MODE_IDLE, "front_obstacle")
             self.drive_status = "front_obstacle"
             return False
         # Treat the lowest unloaded readings after mode entry as this session's zero.
@@ -803,6 +938,7 @@ class CartController:
         self.drive_status = "calibrating"
         self.left_motor.stop()
         self.right_motor.stop()
+        self.hardware_log.event("mode", "to=tow")
         return True
 
     def update_tow_forces(self):
@@ -813,6 +949,9 @@ class CartController:
             0.0, self.right_force - self.tow_right_baseline - TOW_RIGHT_COMP_RAW
         )
 
+    def observe_hardware(self, now):
+        self.hardware_log.observe(self, now)
+
     def update(self, now):
         self.front_obstacle.update(now)
         self.read_sensors()
@@ -821,13 +960,25 @@ class CartController:
         self.unsafe_reason = self.safety_reason()
 
         if self.unsafe_reason:
+            if self.unsafe_reason != self.last_unsafe_reason:
+                self.hardware_log.event(
+                    "safety_stop", "reason={}".format(self.unsafe_reason), now
+                )
+            self.last_unsafe_reason = self.unsafe_reason
             self.manual_left = 0.0
             self.manual_right = 0.0
             self.tow_armed = False
             self.drive_status = "idle"
             self.left_motor.ramp_to(0.0, now)
             self.right_motor.ramp_to(0.0, now)
+            self.observe_hardware(now)
             return
+
+        if self.last_unsafe_reason:
+            self.hardware_log.event(
+                "safety_recovered", "reason={}".format(self.last_unsafe_reason), now
+            )
+            self.last_unsafe_reason = ""
 
         if self.mode == MODE_AUTO and self.front_obstacle.blocked:
             self.tow_armed = False
@@ -836,6 +987,7 @@ class CartController:
             self.drive_status = "front_obstacle"
             self.left_motor.stop()
             self.right_motor.stop()
+            self.observe_hardware(now)
             return
 
         if self.mode == MODE_IDLE:
@@ -850,6 +1002,11 @@ class CartController:
             if (not self.soft_stop_pending and
                     ticks_diff(now, self.last_manual_ms) > MANUAL_TIMEOUT_MS):
                 # Dead-man expiry is a controlled stop, not a hardware fault.
+                self.hardware_log.event(
+                    "manual_timeout",
+                    "age={}".format(ticks_diff(now, self.last_manual_ms)),
+                    now,
+                )
                 self.soft_stop("timeout")
 
             if self.reverse_state == "braking":
@@ -930,6 +1087,7 @@ class CartController:
         right_target *= RIGHT_MOTOR_GAIN
         if self.front_blocks_targets(left_target, right_target):
             self.front_obstacle_stop()
+            self.observe_hardware(now)
             return
 
         self.left_motor.ramp_to(left_target, now)
@@ -939,13 +1097,15 @@ class CartController:
             self.mode = MODE_IDLE
             self.drive_status = self.soft_stop_reason
 
+        self.observe_hardware(now)
+
     def status_line(self):
         return (
             "stat mode={} sensor={} err={} lraw={:.0f} rraw={:.0f} l={:.0f} r={:.0f} "
             "ltow={:.0f} rtow={:.0f} lbase={:.0f} rbase={:.0f} "
             "total={:.0f} steer={:.2f} targetl={:.2f} targetr={:.2f} "
             "pwml={:.2f} pwmr={:.2f} age_ms={} estop={} front={} front_signal={} "
-            "bt={} unsafe={} drive={}"
+            "bt={} unsafe={} drive={} loop_ms={}"
         ).format(
             self.mode,
             "ok" if self.sensor_ok else "bad",
@@ -971,6 +1131,7 @@ class CartController:
             self.ble.connected(),
             self.unsafe_reason or "-",
             self.drive_status,
+            self.last_loop_ms,
         )
 
     def param_line(self):
@@ -1038,7 +1199,7 @@ class CommandInterface:
 
     def help(self):
         self.reply(
-            "help cmd: ver info pins status param stream on|off identify [S] tow auto manual idle stop softstop keepalive tare drive L R f [P] b [P] l [P] r [P] motor SIDE DIR [P] [MS] set NAME VALUE"
+            "help cmd: ver info pins status param stream on|off hwlog dump|clear|status identify [S] tow auto manual idle stop softstop keepalive tare drive L R f [P] b [P] l [P] r [P] motor SIDE DIR [P] [MS] set NAME VALUE"
         )
         self.reply(
             "help set: max_pwm min_pwm start_raw full_raw steer_gain ramp decel_ramp manual_max timeout_ms reverse_neutral_ms left_motor_gain right_motor_gain left_force_gain right_force_gain tow_left_comp tow_right_comp"
@@ -1238,6 +1399,8 @@ class CommandInterface:
             return
 
         command = parts[0].lower()
+        if command not in ("keepalive", "status"):
+            self.controller.hardware_log.event("command", "name={}".format(command))
 
         try:
             if command == "help" or command == "?":
@@ -1268,6 +1431,25 @@ class CommandInterface:
                     self.reply("ok stream=off")
                 else:
                     self.reply("err usage: stream on|off")
+            elif command == "hwlog" or command == "diag":
+                action = parts[1].lower() if len(parts) == 2 else ""
+                if action == "dump" or action == "export":
+                    total = self.controller.hardware_log.begin_export()
+                    self.reply("ok hwlog_export n={}".format(total))
+                elif action == "clear":
+                    self.controller.hardware_log.clear()
+                    self.reply("ok hwlog_clear")
+                elif action == "status":
+                    self.reply(
+                        "ok hwlog_status n={} exporting={}".format(
+                            self.controller.hardware_log.count,
+                            bool_text(
+                                self.controller.hardware_log.export_records is not None
+                            ),
+                        )
+                    )
+                else:
+                    self.reply("err usage: hwlog dump|clear|status")
             elif command == "auto" or command == "tow":
                 if not self.controller.sensor_ok:
                     self.controller.stop(MODE_IDLE)
@@ -1367,6 +1549,7 @@ def main():
     led = make_led()
     ble = BluetoothSerial()
     estop = Pin(ESTOP_PIN, Pin.IN, Pin.PULL_UP)
+    hardware_log = HardwareLogger()
     front_obstacle = FrontObstacleSensor(
         Pin(FRONT_OBSTACLE_PIN, Pin.IN, Pin.PULL_UP)
     )
@@ -1407,7 +1590,8 @@ def main():
     left_hx = HX711(LEFT_HX711_DOUT, LEFT_HX711_SCK)
     right_hx = HX711(RIGHT_HX711_DOUT, RIGHT_HX711_SCK)
     controller = CartController(
-        left_hx, right_hx, left_motor, right_motor, estop, front_obstacle, ble
+        left_hx, right_hx, left_motor, right_motor, estop, front_obstacle, ble,
+        hardware_log
     )
     front_obstacle.attach_stop_callback(controller.front_obstacle_stop)
     led_mode.set_controller(controller)
@@ -1416,7 +1600,8 @@ def main():
     print("Keep both load cells unloaded. Taring...")
     led_mode.pulse(2000)
     controller.tare_sensors()
-    controller.stop(MODE_IDLE)
+    controller.stop(MODE_IDLE, "boot_ready")
+    hardware_log.event("boot", "proto={}".format(PROTOCOL_VERSION))
     print(
         "ble_commands: help pins status identify stream on|off tow auto manual stop softstop keepalive tare drive L R f b l r motor set"
     )
@@ -1425,19 +1610,22 @@ def main():
     last_ble_stream = ticks_ms()
 
     while True:
+        loop_started_ms = ticks_ms()
         now = ticks_ms()
         led_mode.update(now)
 
         connection_event = ble.connection_event()
         if connection_event == 1:
             print("ble_connected=1")
+            hardware_log.event("ble_connect")
             if controller.mode == MODE_AUTO:
-                controller.stop(MODE_IDLE)
+                controller.stop(MODE_IDLE, "ble_connect_auto_reset")
             commands.send_hello()
         elif connection_event == 0:
             print("ble_connected=0")
+            hardware_log.event("ble_disconnect")
             if controller.mode == MODE_MANUAL or controller.mode == MODE_AUTO:
-                controller.stop(MODE_IDLE)
+                controller.stop(MODE_IDLE, "ble_disconnect")
 
         for line in ble.poll_lines():
             commands.handle(line)
@@ -1445,6 +1633,8 @@ def main():
         controller.update(now)
 
         now = ticks_ms()
+        controller.last_loop_ms = max(0, ticks_diff(now, loop_started_ms))
+        hardware_log.record_loop_time(controller.last_loop_ms, now)
         led_mode.update(now)
 
         if ticks_diff(now, last_debug) >= DEBUG_EVERY_MS:
@@ -1454,6 +1644,11 @@ def main():
         if commands.stream and ticks_diff(now, last_ble_stream) >= BLE_STREAM_EVERY_MS:
             last_ble_stream = now
             ble.write(controller.status_line())
+
+        if ble.connected() == 1:
+            hardware_line = hardware_log.next_export_line()
+            if hardware_line is not None:
+                ble.write(hardware_line)
 
         sleep_ms(LOOP_MS)
 

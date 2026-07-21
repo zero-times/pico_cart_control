@@ -84,6 +84,10 @@ data class CartUiState(
     val mamboOverlayStatus: String = "",
     val mamboSpeechText: String = "",
     val mamboSpeechId: Long = 0L,
+    val hardwareLogExporting: Boolean = false,
+    val hardwareLogReceived: Int = 0,
+    val hardwareLogTotal: Int = 0,
+    val hardwareLogStatus: String = "未导出",
     val gamepadState: GamepadState = GamepadState(),
 ) {
     val cartReady: Boolean
@@ -191,6 +195,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val fullLogs = mutableListOf<LogEntry>()
     private var driveJob: Job? = null
     private var heartbeatJob: Job? = null
+    private var hardwareLogExportTimeoutJob: Job? = null
     private var mamboOverlayHideJob: Job? = null
     private var lastLogFile: File? = null
     private var identifyAfterConnected = false
@@ -273,6 +278,32 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun sendStop() = sendCommand("stop")
     fun sendTare() = sendCommand("tare")
     fun sendIdentify() = sendCommand("identify 5")
+
+    fun exportHardwareLog() {
+        if (!sendCommand("hwlog dump")) return
+        hardwareLogExportTimeoutJob?.cancel()
+        _uiState.update {
+            it.copy(
+                hardwareLogExporting = true,
+                hardwareLogReceived = 0,
+                hardwareLogTotal = 0,
+                hardwareLogStatus = "正在请求 Pico 硬件日志",
+            )
+        }
+        addLog("hardware log export requested")
+        hardwareLogExportTimeoutJob = viewModelScope.launch {
+            delay(HARDWARE_LOG_EXPORT_TIMEOUT_MS)
+            if (_uiState.value.hardwareLogExporting) {
+                _uiState.update {
+                    it.copy(
+                        hardwareLogExporting = false,
+                        hardwareLogStatus = "导出超时，日志可能不完整",
+                    )
+                }
+                addLog("hardware log export timeout")
+            }
+        }
+    }
 
     fun toggleStream() {
         val next = !_uiState.value.streaming
@@ -608,6 +639,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     override fun onCleared() {
         releaseDrive(sendStop = false)
         heartbeatJob?.cancel()
+        hardwareLogExportTimeoutJob?.cancel()
         client.close()
         sessionStore.close()
         persistentLogs.appendApp("session_end")
@@ -629,6 +661,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             BleEvent.Disconnected -> {
                 releaseDrive(sendStop = false)
                 heartbeatJob?.cancel()
+                hardwareLogExportTimeoutJob?.cancel()
                 lastHeartbeatElapsedMs = 0L
                 heartbeatMonitorStartedElapsedMs = 0L
                 _uiState.update {
@@ -638,6 +671,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         streaming = false,
                         picoHeartbeatOk = false,
                         picoHeartbeatStatus = "Pico 未连接",
+                        hardwareLogExporting = false,
+                        hardwareLogStatus = if (it.hardwareLogExporting) {
+                            "Pico 已断开，导出中断"
+                        } else {
+                            it.hardwareLogStatus
+                        },
                     )
                 }
             }
@@ -683,6 +722,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun applyLine(line: String) {
         val parsed = PicoProtocol.parseLine(line)
+        if (parsed.type == "hwlog") {
+            handleHardwareLogLine(parsed, line)
+            return
+        }
+        if (parsed.type == "hwlog_end") {
+            finishHardwareLogExport(parsed["n"]?.toIntOrNull())
+            persistentLogs.appendHardware(line)
+            return
+        }
         if (parsed.type != "stat") {
             addLog("< $line")
         }
@@ -708,8 +756,49 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 parsed["stream"]?.let { stream ->
                     _uiState.update { it.copy(streaming = stream == "on") }
                 }
+                parsed["hwlog_export"]?.toIntOrNull()?.let { total ->
+                    _uiState.update {
+                        it.copy(
+                            hardwareLogExporting = true,
+                            hardwareLogTotal = total,
+                            hardwareLogStatus = "正在导出 0/$total 条",
+                        )
+                    }
+                }
             }
         }
+    }
+
+    private fun handleHardwareLogLine(parsed: com.zerotimes.picocart.protocol.ParsedLine, line: String) {
+        persistentLogs.appendHardware(line)
+        val received = parsed["i"]?.toIntOrNull() ?: return
+        val total = parsed["n"]?.toIntOrNull()?.coerceAtLeast(0) ?: 0
+        _uiState.update {
+            it.copy(
+                hardwareLogExporting = true,
+                hardwareLogReceived = received,
+                hardwareLogTotal = total,
+                hardwareLogStatus = "正在导出 $received/$total 条",
+            )
+        }
+        if (received == 1 || received % HARDWARE_LOG_PROGRESS_LOG_INTERVAL == 0 || received == total) {
+            addLog("hardware log export $received/$total")
+        }
+    }
+
+    private fun finishHardwareLogExport(totalFromEnd: Int?) {
+        hardwareLogExportTimeoutJob?.cancel()
+        _uiState.update { state ->
+            val total = totalFromEnd ?: state.hardwareLogTotal
+            val received = state.hardwareLogReceived.coerceAtMost(total.coerceAtLeast(0))
+            state.copy(
+                hardwareLogExporting = false,
+                hardwareLogReceived = received,
+                hardwareLogTotal = total,
+                hardwareLogStatus = "已导出 $received/$total 条",
+            )
+        }
+        addLog("hardware log export complete n=${totalFromEnd ?: _uiState.value.hardwareLogTotal}")
     }
 
     private fun addLog(message: String) {
@@ -932,6 +1021,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         const val HEARTBEAT_TIMEOUT_MS = 4_500L
         const val HEARTBEAT_RESPONSE_TIMEOUT_MS = 900L
         const val MANUAL_KEEPALIVE_INTERVAL_MS = 250L
+        const val HARDWARE_LOG_EXPORT_TIMEOUT_MS = 12_000L
+        const val HARDWARE_LOG_PROGRESS_LOG_INTERVAL = 24
         val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.US)
         val fileTimeFormat = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
         val LOCAL_STOP_COMMANDS = setOf("停车", "急停", "取消")

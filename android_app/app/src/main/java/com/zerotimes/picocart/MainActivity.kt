@@ -277,6 +277,7 @@ private fun PicoCartApp(
         onStop = viewModel::sendStop,
         onTare = viewModel::sendTare,
         onIdentify = viewModel::sendIdentify,
+        onExportHardwareLog = viewModel::exportHardwareLog,
         onToggleStream = viewModel::toggleStream,
         onPowerChange = viewModel::onPowerChange,
         onDrivePress = viewModel::holdDrive,
@@ -337,6 +338,7 @@ private fun PicoCartScreen(
     onStop: () -> Unit,
     onTare: () -> Unit,
     onIdentify: () -> Unit,
+    onExportHardwareLog: () -> Unit,
     onToggleStream: () -> Unit,
     onPowerChange: (Float) -> Unit,
     onDrivePress: (String) -> Unit,
@@ -509,6 +511,7 @@ private fun PicoCartScreen(
                                 onStop = onStop,
                                 onTare = onTare,
                                 onIdentify = onIdentify,
+                                onExportHardwareLog = onExportHardwareLog,
                                 onToggleStream = onToggleStream,
                                 onStatus = onStatus,
                                 onAuto = onAuto,
@@ -1532,6 +1535,7 @@ private fun DebugActionSection(
     onStop: () -> Unit,
     onTare: () -> Unit,
     onIdentify: () -> Unit,
+    onExportHardwareLog: () -> Unit,
     onToggleStream: () -> Unit,
     onStatus: () -> Unit,
     onAuto: () -> Unit,
@@ -1566,7 +1570,30 @@ private fun DebugActionSection(
             ActionButton("牵引绳", Icons.Filled.PlayArrow, onAuto, enabled = state.cartReady)
             ActionButton("HX711 归零", Icons.Filled.Refresh, onTare, enabled = state.cartReady)
             ActionButton("闪灯识别", Icons.Filled.Warning, onIdentify, enabled = state.cartReady)
+            ActionButton(
+                if (state.hardwareLogExporting) "导出中" else "导出硬件日志",
+                Icons.Filled.Save,
+                onExportHardwareLog,
+                enabled = state.cartReady && !state.hardwareLogExporting,
+            )
             ActionButton(if (state.streaming) "关流" else "开流", Icons.Filled.PlayArrow, onToggleStream, enabled = state.cartReady)
+        }
+        Spacer(Modifier.height(10.dp))
+        Text(
+            state.hardwareLogStatus,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (state.hardwareLogExporting) {
+            val total = state.hardwareLogTotal
+            if (total > 0) {
+                LinearProgressIndicator(
+                    progress = { state.hardwareLogReceived.toFloat() / total.toFloat() },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            } else {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            }
         }
     }
 }
