@@ -5,7 +5,10 @@ package com.zerotimes.picocart
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.view.KeyEvent
 import android.view.MotionEvent
 import androidx.compose.animation.AnimatedVisibility
@@ -65,6 +68,7 @@ import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
@@ -223,6 +227,15 @@ private fun PicoCartApp(
             viewModel.onMamboVoiceError("录音权限被拒绝")
         }
     }
+    val installPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) {
+        val pending = state.appUpdateInstallUri
+        if (pending.isNotBlank() && canInstallUnknownApps(context)) {
+            installDownloadedApk(context, pending)
+            viewModel.consumeAppUpdateInstallUri()
+        }
+    }
 
     DisposableEffect(mamboVoiceListener) {
         onDispose { mamboVoiceListener.destroy() }
@@ -252,6 +265,19 @@ private fun PicoCartApp(
         if (state.mamboSpeechText.isNotBlank()) {
             mamboVoiceListener.suspendFor(estimateSpeechDurationMs(state.mamboSpeechText))
             speak(state.mamboSpeechText)
+        }
+    }
+
+    LaunchedEffect(state.appUpdateInstallUri) {
+        val uri = state.appUpdateInstallUri
+        if (uri.isBlank()) return@LaunchedEffect
+        if (canInstallUnknownApps(context)) {
+            installDownloadedApk(context, uri)
+            viewModel.consumeAppUpdateInstallUri()
+        } else {
+            installPermissionLauncher.launch(
+                Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${context.packageName}")),
+            )
         }
     }
 
@@ -289,6 +315,10 @@ private fun PicoCartApp(
         onRequestFirmwareUpdate = viewModel::requestFirmwareUpdate,
         onConfirmFirmwareUpdate = viewModel::confirmFirmwareUpdate,
         onDismissFirmwareUpdate = viewModel::dismissFirmwareUpdate,
+        onCheckAppUpdate = { viewModel.checkAppUpdate(silent = false) },
+        onRequestAppUpdate = viewModel::requestAppUpdate,
+        onConfirmAppUpdate = viewModel::confirmAppUpdate,
+        onDismissAppUpdate = viewModel::dismissAppUpdate,
         onToggleStream = viewModel::toggleStream,
         onPowerChange = viewModel::onPowerChange,
         onDrivePress = viewModel::holdDrive,
@@ -364,6 +394,10 @@ private fun PicoCartScreen(
     onRequestFirmwareUpdate: () -> Unit,
     onConfirmFirmwareUpdate: () -> Unit,
     onDismissFirmwareUpdate: () -> Unit,
+    onCheckAppUpdate: () -> Unit,
+    onRequestAppUpdate: () -> Unit,
+    onConfirmAppUpdate: () -> Unit,
+    onDismissAppUpdate: () -> Unit,
     onToggleStream: () -> Unit,
     onPowerChange: (Float) -> Unit,
     onDrivePress: (String) -> Unit,
@@ -405,6 +439,19 @@ private fun PicoCartScreen(
             text = { Text(prompt) },
             confirmButton = { TextButton(onClick = onConfirmFirmwareUpdate) { Text("开始更新") } },
             dismissButton = { TextButton(onClick = onDismissFirmwareUpdate) { Text("稍后") } },
+        )
+    }
+    state.appUpdatePrompt?.let { prompt ->
+        AlertDialog(
+            onDismissRequest = { if (!state.appUpdateForce) onDismissAppUpdate() },
+            title = { Text("更新 App") },
+            text = { Text(prompt) },
+            confirmButton = { TextButton(onClick = onConfirmAppUpdate) { Text("下载并安装") } },
+            dismissButton = {
+                if (!state.appUpdateForce) {
+                    TextButton(onClick = onDismissAppUpdate) { Text("稍后") }
+                }
+            },
         )
     }
     Box(Modifier.fillMaxSize()) {
@@ -581,6 +628,13 @@ private fun PicoCartScreen(
                         }
                     }
                     "settings" -> {
+                        item {
+                            AppUpdateSection(
+                                state = state,
+                                onCheckAppUpdate = onCheckAppUpdate,
+                                onRequestAppUpdate = onRequestAppUpdate,
+                            )
+                        }
                         item {
                             AssistantSettingsSection(
                                 state = state,
@@ -1804,6 +1858,54 @@ private fun DeviceRow(
 }
 
 @Composable
+private fun AppUpdateSection(
+    state: CartUiState,
+    onCheckAppUpdate: () -> Unit,
+    onRequestAppUpdate: () -> Unit,
+) {
+    Section(title = "App 更新") {
+        Text("当前版本：${state.appVersionName} (${state.appVersionCode})", style = MaterialTheme.typography.bodySmall)
+        Text(state.appUpdateStatus, style = MaterialTheme.typography.bodySmall)
+        if (state.appUpdateAvailable && state.pendingAppRelease != null) {
+            Text(
+                "蒲公英最新：${state.pendingAppRelease.displayVersion}",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        if (state.appUpdateDownloading) {
+            Spacer(Modifier.height(8.dp))
+            val total = state.appUpdateTotal
+            if (total > 0L) {
+                LinearProgressIndicator(
+                    progress = { (state.appUpdateReceived.toFloat() / total.toFloat()).coerceIn(0f, 1f) },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            } else {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            }
+        }
+        Spacer(Modifier.height(10.dp))
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            ActionButton(
+                if (state.appUpdateChecking) "检查中" else "检查更新",
+                Icons.Filled.Refresh,
+                onCheckAppUpdate,
+                enabled = !state.appUpdateChecking && !state.appUpdateDownloading,
+            )
+            ActionButton(
+                if (state.appUpdateDownloading) "下载中" else "下载并安装",
+                Icons.Filled.SystemUpdate,
+                onRequestAppUpdate,
+                enabled = !state.appUpdateDownloading && state.appUpdateAvailable,
+            )
+        }
+    }
+}
+
+@Composable
 private fun AssistantSettingsSection(
     state: CartUiState,
     onAgentApiKeyInput: (String) -> Unit,
@@ -2588,4 +2690,22 @@ private fun String.normalizeMamboTranscript(): String {
     if (isBlank()) return ""
     return replace(Regex("漫步|慢不|兰博|蓝波|曼播|mambo", RegexOption.IGNORE_CASE), "曼波")
         .trim()
+}
+
+private fun canInstallUnknownApps(context: android.content.Context): Boolean {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        context.packageManager.canRequestPackageInstalls()
+    } else {
+        true
+    }
+}
+
+private fun installDownloadedApk(context: android.content.Context, uriValue: String) {
+    val uri = Uri.parse(uriValue)
+    val intent = Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(uri, "application/vnd.android.package-archive")
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    context.startActivity(intent)
 }

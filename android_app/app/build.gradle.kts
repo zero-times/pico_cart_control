@@ -1,7 +1,19 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+}
+
+val localProperties = Properties()
+val localPropertiesFile = rootProject.file("local.properties")
+if (localPropertiesFile.exists()) {
+    localPropertiesFile.inputStream().use { localProperties.load(it) }
+}
+
+fun localProperty(name: String, fallback: String = ""): String {
+    return localProperties.getProperty(name) ?: fallback
 }
 
 android {
@@ -12,13 +24,17 @@ android {
         applicationId = "com.zerotimes.picocart"
         minSdk = 26
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.1.3"
+        versionCode = 5
+        versionName = "0.1.4"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
         }
+
+        buildConfigField("String", "PGYER_API_KEY", "\"${localProperty("pgyer.apiKey")}\"")
+        buildConfigField("String", "PGYER_APP_KEY", "\"${localProperty("pgyer.appKey", "a4b89ad0e653b85ff4a601ed922cc8c1")}\"")
+        buildConfigField("String", "PGYER_API_BASE", "\"${localProperty("pgyer.apiBase", "https://api.pgyer.com")}\"")
     }
 
     buildTypes {

@@ -24,9 +24,13 @@ import com.zerotimes.picocart.logging.PersistentDebugLogStore
 import com.zerotimes.picocart.logging.HardwareLogExport
 import com.zerotimes.picocart.protocol.PicoProtocol
 import com.zerotimes.picocart.speech.MamboVoiceState
+import com.zerotimes.picocart.update.PgyerAppRelease
+import com.zerotimes.picocart.update.PgyerAppUpdateClient
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -35,6 +39,9 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.File
+import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -96,6 +103,18 @@ data class CartUiState(
     val firmwareUpdateReceived: Int = 0,
     val firmwareUpdateTotal: Int = 0,
     val firmwareUpdatePrompt: String? = null,
+    val appVersionName: String = BuildConfig.VERSION_NAME,
+    val appVersionCode: Int = BuildConfig.VERSION_CODE,
+    val appUpdateStatus: String = "未检查",
+    val appUpdateChecking: Boolean = false,
+    val appUpdateAvailable: Boolean = false,
+    val appUpdateForce: Boolean = false,
+    val appUpdatePrompt: String? = null,
+    val appUpdateDownloading: Boolean = false,
+    val appUpdateReceived: Long = 0L,
+    val appUpdateTotal: Long = 0L,
+    val appUpdateInstallUri: String = "",
+    val pendingAppRelease: PgyerAppRelease? = null,
     val clockSyncStatus: String = "未同步",
     val clockSyncing: Boolean = false,
     val hardwareLogUsed: Int? = null,
@@ -245,6 +264,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var mamboOverlayHideJob: Job? = null
     private var firmwareUpdateJob: Job? = null
     @Volatile private var firmwareUpdateGeneration = 0L
+    private var appUpdateCheckJob: Job? = null
+    private var appUpdateDownloadJob: Job? = null
+    @Volatile private var appUpdateDownloadGeneration = 0L
+    private val pgyerAppUpdateClient = PgyerAppUpdateClient(
+        apiKey = BuildConfig.PGYER_API_KEY,
+        appKey = BuildConfig.PGYER_APP_KEY,
+        apiBase = BuildConfig.PGYER_API_BASE.ifBlank { PgyerAppUpdateClient.DEFAULT_API_BASE },
+    )
     @Volatile private var pendingFirmwareAck: CompletableDeferred<String>? = null
     private var lastLogFile: File? = null
     private var identifyAfterConnected = false
@@ -257,6 +284,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         persistentLogs.appendVoice("session_start package=${application.packageName} voice_log=${persistentLogs.voiceLogPath}")
         addLog("persistent logs app=${persistentLogs.appLogPath} voice=${persistentLogs.voiceLogPath}")
         loadBundledFirmwareInfo()
+        checkAppUpdate(silent = true)
     }
 
     fun requiredBlePermissions(): Array<String> = client.requiredPermissions()
@@ -799,6 +827,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         releaseDrive(sendStop = false)
         heartbeatJob?.cancel()
         hardwareLogExportTimeoutJob?.cancel()
+        appUpdateCheckJob?.cancel()
+        appUpdateDownloadJob?.cancel()
         client.close()
         sessionStore.close()
         persistentLogs.appendApp("session_end")
@@ -1110,6 +1140,88 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun checkAppUpdate(silent: Boolean = false) {
+        if (_uiState.value.appUpdateDownloading) {
+            if (!silent) {
+                _uiState.update { it.copy(appUpdateStatus = "正在下载新版本") }
+            }
+            return
+        }
+        appUpdateCheckJob?.cancel()
+        appUpdateCheckJob = viewModelScope.launch {
+            _uiState.update {
+                it.copy(
+                    appUpdateChecking = true,
+                    appUpdateStatus = if (silent) it.appUpdateStatus.ifBlank { "正在检查新版本" } else "正在检查新版本",
+                )
+            }
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    pgyerAppUpdateClient.check(BuildConfig.VERSION_NAME, BuildConfig.VERSION_CODE)
+                }
+            }
+            result.fold(
+                onSuccess = { release ->
+                    val status = if (release.hasNewVersion) {
+                        "发现新版本 ${release.displayVersion}"
+                    } else {
+                        "已是最新版 ${BuildConfig.VERSION_NAME}"
+                    }
+                    val prompt = if (release.hasNewVersion) {
+                        buildAppUpdatePrompt(release)
+                    } else {
+                        null
+                    }
+                    _uiState.update {
+                        it.copy(
+                            appUpdateChecking = false,
+                            appUpdateAvailable = release.hasNewVersion,
+                            appUpdateForce = release.forceUpdate,
+                            appUpdateStatus = status,
+                            pendingAppRelease = release.takeIf { item -> item.hasNewVersion },
+                            appUpdatePrompt = prompt ?: it.appUpdatePrompt,
+                        )
+                    }
+                    addLog("app update check has_new=${if (release.hasNewVersion) 1 else 0} version=${release.versionName} code=${release.versionCode ?: "-"}")
+                },
+                onFailure = { error ->
+                    val message = "检查更新失败：${error.message ?: error.javaClass.simpleName}"
+                    _uiState.update {
+                        it.copy(
+                            appUpdateChecking = false,
+                            appUpdateStatus = if (silent && it.appUpdateAvailable) it.appUpdateStatus else message,
+                        )
+                    }
+                    addLog("app update check error ${error.message ?: error}")
+                },
+            )
+        }
+    }
+
+    fun requestAppUpdate() {
+        val pending = _uiState.value.pendingAppRelease
+        if (pending == null || !pending.hasNewVersion) {
+            checkAppUpdate(silent = false)
+            return
+        }
+        _uiState.update { it.copy(appUpdatePrompt = buildAppUpdatePrompt(pending)) }
+    }
+
+    fun dismissAppUpdate() {
+        if (_uiState.value.appUpdateForce && _uiState.value.appUpdateAvailable) return
+        _uiState.update { it.copy(appUpdatePrompt = null) }
+    }
+
+    fun confirmAppUpdate() {
+        val release = _uiState.value.pendingAppRelease ?: return
+        _uiState.update { it.copy(appUpdatePrompt = null) }
+        downloadAppUpdate(release)
+    }
+
+    fun consumeAppUpdateInstallUri() {
+        _uiState.update { it.copy(appUpdateInstallUri = "") }
+    }
+
     fun requestFirmwareUpdate() {
         val state = _uiState.value
         if (!state.connected || state.firmwareUpdating) return
@@ -1137,6 +1249,131 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (_uiState.value.firmwareUpdatePrompt == null) return
         dismissFirmwareUpdate()
         startFirmwareUpdate()
+    }
+
+    private fun buildAppUpdatePrompt(release: PgyerAppRelease): String {
+        val size = PgyerAppUpdateClient.formatFileSize(release.fileSizeBytes)
+        val notes = release.updateDescription.trim().ifBlank { "本次未提供更新说明。" }
+        return buildString {
+            append("发现 Pico Cart Debug ${release.displayVersion}")
+            if (size.isNotBlank()) append("，约 $size")
+            append("。\n\n")
+            append(notes)
+            append("\n\n下载完成后会直接打开安装。")
+        }
+    }
+
+    private fun downloadAppUpdate(release: PgyerAppRelease) {
+        if (release.downloadUrl.isBlank()) {
+            _uiState.update { it.copy(appUpdateStatus = "新版本没有可用的下载地址") }
+            return
+        }
+        appUpdateDownloadJob?.cancel()
+        val generation = ++appUpdateDownloadGeneration
+        appUpdateDownloadJob = viewModelScope.launch {
+            _uiState.update {
+                it.copy(
+                    appUpdateDownloading = true,
+                    appUpdateReceived = 0L,
+                    appUpdateTotal = release.fileSizeBytes ?: 0L,
+                    appUpdateStatus = "正在下载 ${release.displayVersion}",
+                    appUpdateInstallUri = "",
+                )
+            }
+            val result = runCatching {
+                withContext(Dispatchers.IO) { downloadApk(release.downloadUrl, generation) }
+            }
+            if (generation != appUpdateDownloadGeneration) return@launch
+            result.fold(
+                onSuccess = { file ->
+                    val uri = FileProvider.getUriForFile(
+                        getApplication(),
+                        "${getApplication<Application>().packageName}.fileprovider",
+                        file,
+                    )
+                    _uiState.update {
+                        it.copy(
+                            appUpdateDownloading = false,
+                            appUpdateReceived = file.length(),
+                            appUpdateTotal = file.length(),
+                            appUpdateStatus = "下载完成，正在打开安装",
+                            appUpdateInstallUri = uri.toString(),
+                        )
+                    }
+                    addLog("app update downloaded ${file.name} bytes=${file.length()}")
+                },
+                onFailure = { error ->
+                    _uiState.update {
+                        it.copy(
+                            appUpdateDownloading = false,
+                            appUpdateStatus = "下载失败：${error.message ?: error.javaClass.simpleName}",
+                        )
+                    }
+                    addLog("app update download error ${error.message ?: error}")
+                },
+            )
+        }
+    }
+
+    private fun downloadApk(url: String, generation: Long): File {
+        val dir = File(getApplication<Application>().cacheDir, "updates").apply { mkdirs() }
+        val output = File(dir, "pico-cart-update.apk")
+        val partial = File(dir, "pico-cart-update.apk.part")
+        if (partial.exists()) partial.delete()
+        var currentUrl = url
+        repeat(5) {
+            val connection = (URL(currentUrl).openConnection() as HttpURLConnection).apply {
+                instanceFollowRedirects = false
+                connectTimeout = 15_000
+                readTimeout = 30_000
+                setRequestProperty("Accept", "*/*")
+            }
+            try {
+                val code = connection.responseCode
+                if (code in 300..399) {
+                    val next = connection.getHeaderField("Location") ?: throw IllegalStateException("missing redirect")
+                    currentUrl = if (next.startsWith("http")) next else URL(URL(currentUrl), next).toString()
+                    return@repeat
+                }
+                if (code !in 200..299) {
+                    throw IllegalStateException("HTTP $code")
+                }
+                val total = connection.contentLengthLong.takeIf { it > 0L } ?: 0L
+                connection.inputStream.use { input ->
+                    FileOutputStream(partial).use { outputStream ->
+                        val buffer = ByteArray(64 * 1024)
+                        var copied = 0L
+                        while (true) {
+                            if (generation != appUpdateDownloadGeneration) {
+                                throw IllegalStateException("download cancelled")
+                            }
+                            val read = input.read(buffer)
+                            if (read <= 0) break
+                            outputStream.write(buffer, 0, read)
+                            copied += read
+                            if (copied == read.toLong() || copied % (512 * 1024) == 0L) {
+                                _uiState.update { state ->
+                                    state.copy(
+                                        appUpdateReceived = copied,
+                                        appUpdateTotal = if (total > 0L) total else state.appUpdateTotal,
+                                        appUpdateStatus = "正在下载 ${copied / (1024 * 1024)} MB",
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+                if (output.exists()) output.delete()
+                if (!partial.renameTo(output)) {
+                    partial.copyTo(output, overwrite = true)
+                    partial.delete()
+                }
+                return output
+            } finally {
+                connection.disconnect()
+            }
+        }
+        throw IllegalStateException("too many redirects")
     }
 
     private fun loadBundledFirmwareInfo() {
