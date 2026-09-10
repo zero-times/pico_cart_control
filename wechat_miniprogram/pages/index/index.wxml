@@ -36,7 +36,7 @@
   <view class="section diagnostics">
     <view class="section-head">
       <text>硬件诊断</text>
-      <text class="muted mono">固件 {{firmware}}</text>
+      <text class="muted mono">固件 {{firmware}} · {{linkStatus}}</text>
     </view>
     <view class="diagnostic-row">
       <view>
@@ -46,6 +46,7 @@
       <button class="mini-button diagnostic-button" bindtap="syncTime" disabled="{{!connected || timeSyncState === '同步中'}}">手动同步时间</button>
     </view>
     <view class="muted diagnostic-note">{{timeSyncDetail}}</view>
+    <view wx:if="{{lastBleError}}" class="diagnostic-note text-warning">最近蓝牙错误：{{lastBleError}}</view>
     <view class="diagnostic-row">
       <text class="diagnostic-label">RAM 缓存</text>
       <text class="mono {{hardwareStatus.percent >= 90 ? 'text-warning' : ''}}">{{hardwareStatus ? hardwareStatus.count + ' / ' + hardwareStatus.capacity + ' 条 · ' + hardwareStatus.percent + '%' : '等待查询'}}</text>

@@ -99,6 +99,8 @@ data class CartUiState(
     val hardwareLogReceived: Int = 0,
     val hardwareLogTotal: Int = 0,
     val hardwareLogStatus: String = "未导出",
+    val linkStatus: String = "未连接",
+    val lastGattStatus: String = "",
     val gamepadState: GamepadState = GamepadState(),
 ) {
     val cartReady: Boolean
@@ -285,6 +287,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 connecting = false,
                 picoHeartbeatOk = false,
                 picoHeartbeatStatus = "Pico 未连接",
+                linkStatus = "未连接",
+                lastGattStatus = "",
                 deviceId = "",
                 deviceName = "",
                 serviceId = "",
@@ -758,13 +762,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             is BleEvent.ScanState -> _uiState.update { it.copy(scanning = event.scanning) }
             is BleEvent.Connected -> handleConnected(event.device, event.channel)
-            BleEvent.Disconnected -> {
+            is BleEvent.Disconnected -> {
                 cancelConnectionDiagnostics()
                 releaseDrive(sendStop = false)
                 heartbeatJob?.cancel()
                 hardwareLogExportTimeoutJob?.cancel()
                 lastHeartbeatElapsedMs = 0L
                 heartbeatMonitorStartedElapsedMs = 0L
+                val gattText = event.gattStatus?.let { "GATT $it" }.orEmpty()
                 _uiState.update {
                     it.copy(
                         connected = false,
@@ -772,6 +777,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         streaming = false,
                         picoHeartbeatOk = false,
                         picoHeartbeatStatus = "Pico 未连接",
+                        linkStatus = "已断开：${event.reason}",
+                        lastGattStatus = gattText,
                         hardwareLogExporting = false,
                         hardwareLogStatus = if (it.hardwareLogExporting) {
                             "Pico 已断开，导出中断"
@@ -780,12 +787,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         },
                     )
                 }
+                addLog("disconnected reason=${event.reason} gatt=${event.gattStatus ?: "-"} state=${event.newState ?: "-"}")
             }
             is BleEvent.LineReceived -> applyLine(event.line)
             is BleEvent.Log -> addLog(event.message)
             is BleEvent.Error -> {
                 addLog(event.message)
-                _uiState.update { it.copy(connecting = false) }
+                _uiState.update {
+                    it.copy(
+                        connecting = false,
+                        lastGattStatus = event.message,
+                        linkStatus = if (it.connected) it.linkStatus else event.message,
+                    )
+                }
             }
         }
     }
@@ -804,6 +818,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 writeCharId = channel.writeCharId,
                 notifyCharId = channel.notifyCharId,
                 writeNoResponse = channel.writeNoResponse,
+                linkStatus = "已连接，等待心跳",
+                lastGattStatus = "GATT 0",
             )
         }
         lastHeartbeatElapsedMs = 0L

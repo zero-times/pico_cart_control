@@ -234,7 +234,7 @@ identify 5：快闪 5 秒，然后自动回到上述状态
 
 ```text
 info proto=pico-cart-ble-2026-07-04 uart=UART0 tx=GP0 rx=GP1 state=GP15 right_inb=GP17 auto_start=0
-param max_pwm=0.45 min_pwm=0.14 start_raw=25000 full_raw=180000 steer_gain=0.75 ramp=0.018 manual_max=0.25 timeout_ms=700
+param max_pwm=0.45 min_pwm=0.14 start_raw=25000 full_raw=180000 steer_gain=0.75 ramp=0.018 manual_max=0.25 timeout_ms=1200
 stat mode=idle sensor=ok err=- lraw=0 rraw=0 l=0 r=0 total=0 steer=0.00 pwml=0.00 pwmr=0.00 estop=1 bt=1 unsafe=-
 ok stop
 err unknown_cmd
@@ -536,7 +536,7 @@ adb shell tail -n 120 /sdcard/Android/data/com.zerotimes.picocart/files/logs/pic
 
 ### Pico 硬件诊断日志
 
-Pico 固件 `0.2.0` 在 RAM 中保留最近 `192` 条诊断记录；满后覆盖最旧记录，断电后丢失，
+Pico 固件 `0.2.1` 在 RAM 中保留最近 `192` 条诊断记录；满后覆盖最旧记录，断电后丢失，
 行驶中不为日志写 Flash。每条记录带固件版本、全局序号、单调启动时长和校时状态对应的时间。
 记录覆盖连接、命令、传感器异常、停车原因与运行快照。
 
@@ -554,7 +554,8 @@ MicroPython REPL 和刷写能力保留。
 可借助 `time_sync` 事件和启动时长人工关联，不能视作已精确校时的记录。
 
 连接中断或导出超时、缺号时，App 提示日志可能不完整，不应确认清理。完整采集步骤、线协议
-和硬件验收清单见 [Pico 诊断日志指南](docs/PICO_DIAGNOSTIC_LOGS_GUIDE.md)。Android 日志可取出：
+和硬件验收清单见 [Pico 诊断日志指南](docs/PICO_DIAGNOSTIC_LOGS_GUIDE.md)。蓝牙断线与安全重连
+步骤见 [Pico BLE 稳定性指南](docs/PICO_BLE_STABILITY_GUIDE.md)。Android 日志可取出：
 
 ```bash
 adb pull /sdcard/Android/data/com.zerotimes.picocart/files/logs/pico_cart_debug.log .

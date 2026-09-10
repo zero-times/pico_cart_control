@@ -142,6 +142,8 @@ Page({
     firmware: '-',
     timeSyncState: '未同步',
     timeSyncDetail: '连接后自动同步手机时间',
+    linkStatus: '未连接',
+    lastBleError: '',
     hardwareStatus: null,
     diagnosticsMessage: 'RAM 日志未查询',
     exportActive: false,
@@ -386,13 +388,16 @@ Page({
       return
     }
     if (!res.connected) {
+      const errCode = res.errCode == null ? '-' : res.errCode
       this.setData({
         connected: false,
-        streaming: false
+        streaming: false,
+        linkStatus: `已断开 errCode=${errCode}`,
+        lastBleError: `errCode=${errCode}`
       })
       this.invalidateConnection('蓝牙断开，日志未完整接收')
-      this.releaseDrive()
-      this.addLog('device disconnected')
+      this.releaseDrive(false)
+      this.addLog(`device disconnected errCode=${errCode}`)
     }
   },
 
@@ -447,14 +452,26 @@ Page({
   },
 
   async connectDevice(device) {
-    if (this.data.connecting || this.data.connected) return false
+    const previousId = this.data.deviceId
+    if (this.data.connecting || this.data.connected || previousId) {
+      this.releaseDrive(false)
+      this.invalidateConnection('重新连接')
+      if (previousId) {
+        try {
+          await wxCall('closeBLEConnection', { deviceId: previousId })
+        } catch (err) {
+          this.addLog(`reconnect close ${err.errMsg || err}`)
+        }
+      }
+    }
     this.invalidateConnection('重新连接')
     const session = this.connectionSession
     const assertCurrent = () => {
       if (session !== this.connectionSession || this.unloaded) throw new Error('connection canceled')
     }
     this.setData({ connecting: true, deviceId: device.deviceId, firmware: '-', hardwareStatus: null,
-      timeSyncState: '未同步', timeSyncDetail: '连接后自动同步手机时间', diagnosticsMessage: 'RAM 日志未查询' })
+      timeSyncState: '未同步', timeSyncDetail: '连接后自动同步手机时间', diagnosticsMessage: 'RAM 日志未查询',
+      linkStatus: '正在连接', lastBleError: '' })
     this.addLog(`connect ${device.name}`)
     try {
       if (this.data.scanning) {
@@ -463,7 +480,7 @@ Page({
       }
       await wxCall('createBLEConnection', {
         deviceId: device.deviceId,
-        timeout: 10000
+        timeout: 12000
       })
       assertCurrent()
 
@@ -471,7 +488,7 @@ Page({
         try {
           await wxCall('setBLEMTU', {
             deviceId: device.deviceId,
-            mtu: 128
+            mtu: 64
           })
         } catch (err) {
           this.addLog(`mtu keep default ${err.errMsg || err}`)
@@ -498,7 +515,9 @@ Page({
         serviceId: channel.serviceId,
         writeCharId: channel.writeCharId,
         notifyCharId: channel.notifyCharId,
-        writeNoResponse: !!channel.writeProperties.writeNoResponse
+        writeNoResponse: !!channel.writeProperties.writeNoResponse,
+        linkStatus: '已连接',
+        lastBleError: ''
       })
 
       this.addLog(`channel ${channel.serviceId} ${channel.writeCharId}`)
@@ -516,11 +535,11 @@ Page({
       return true
     } catch (err) {
       if (session !== this.connectionSession || this.unloaded) return false
-      this.setData({ connecting: false })
+      this.setData({ connecting: false, lastBleError: String(err.errMsg || err), linkStatus: '连接失败' })
       this.invalidateConnection('连接初始化失败')
       wx.closeBLEConnection({ deviceId: device.deviceId })
       this.setData({ connected: false })
-      this.addLog(`connect error ${err.errMsg || err}`)
+      this.addLog(`connect error ${err.errMsg || err} errCode=${err.errCode == null ? '-' : err.errCode}`)
       wx.showToast({
         title: '连接失败',
         icon: 'none'
@@ -548,7 +567,9 @@ Page({
       serviceId: '',
       writeCharId: '',
       notifyCharId: '',
-      writeNoResponse: false
+      writeNoResponse: false,
+      linkStatus: '未连接',
+      lastBleError: ''
     })
   },
 
@@ -660,20 +681,36 @@ Page({
     }
   },
 
+  commandKind(command) {
+    const name = String(command || '').trim().split(/\s+/)[0] || ''
+    if (name === 'stop' || name === 's') return 'hard_stop'
+    if (name === 'softstop') return 'soft_stop'
+    if (['f', 'b', 'l', 'r', 'drive', 'keepalive', 'motor', 'motortest'].indexOf(name) >= 0) return 'movement'
+    return 'regular'
+  },
+
   sendCommand(command) {
     const text = String(command || '').trim()
     if (!this.data.connected || !text) return Promise.resolve(false)
     if (!this.commandQueue) this.commandQueue = []
+    const kind = this.commandKind(text)
     return new Promise((resolve) => {
-      // Keep safety stops ahead of queued work, and never replay stale drive repeats.
-      if (text === 'stop' || /^[fblr] /.test(text)) {
+      if (kind === 'hard_stop' || kind === 'soft_stop' || kind === 'movement') {
         this.commandQueue = this.commandQueue.filter((entry) => {
-          if (/^[fblr] /.test(entry.command)) { entry.resolve(false); return false }
+          const existing = this.commandKind(entry.command)
+          if (existing === 'movement' || (kind === 'hard_stop' && existing === 'soft_stop')) {
+            entry.resolve(false)
+            return false
+          }
           return true
         })
       }
-      const entry = { command: text, session: this.connectionSession, resolve }
-      if (text === 'stop') this.commandQueue.unshift(entry)
+      if (kind === 'movement' && text === 'keepalive' && this.commandQueue.some((entry) => entry.command === 'keepalive')) {
+        resolve(false)
+        return
+      }
+      const entry = { command: text, session: this.connectionSession, resolve, kind }
+      if (kind === 'hard_stop' || kind === 'soft_stop') this.commandQueue.unshift(entry)
       else this.commandQueue.push(entry)
       this.drainCommands()
     })
@@ -692,7 +729,11 @@ Page({
           await this.writeBytes(str2bytes(`${entry.command}\n`), session, Object.assign({}, this.data))
           entry.resolve(session === this.connectionSession)
         } catch (err) {
-          if (session === this.connectionSession) this.addLog(`write error ${err.errMsg || err}`)
+          if (session === this.connectionSession) {
+            const detail = `write error ${err.errMsg || err} errCode=${err.errCode == null ? '-' : err.errCode}`
+            this.addLog(detail)
+            this.setData({ lastBleError: detail })
+          }
           entry.resolve(false)
         }
       }
@@ -756,7 +797,7 @@ Page({
     if (!this.data.connected || this.pageHidden) return
     const session = this.connectionSession
     this.diagnosticsTimer = setInterval(() => {
-      if (session === this.connectionSession && !this.writeBusy && !this.timeSyncPending) this.refreshHardwareStatus()
+      if (session === this.connectionSession && !this.writeBusy && !this.timeSyncPending && !this.data.exportActive) this.refreshHardwareStatus()
     }, 15000)
   },
 
@@ -995,7 +1036,7 @@ Page({
     this.releaseDrive(false)
     this.sendCommand(command)
     this.driveTimer = setInterval(() => {
-      this.sendCommand(command)
+      this.sendCommand('keepalive')
     }, 260)
   },
 

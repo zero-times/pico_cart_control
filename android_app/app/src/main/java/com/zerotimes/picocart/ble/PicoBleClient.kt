@@ -45,7 +45,11 @@ sealed interface BleEvent {
     data class DeviceFound(val device: BleDeviceItem) : BleEvent
     data class ScanState(val scanning: Boolean) : BleEvent
     data class Connected(val device: BleDeviceItem, val channel: BleChannel) : BleEvent
-    data object Disconnected : BleEvent
+    data class Disconnected(
+        val reason: String,
+        val gattStatus: Int? = null,
+        val newState: Int? = null,
+    ) : BleEvent
     data class LineReceived(val line: String) : BleEvent
     data class Log(val message: String) : BleEvent
     data class Error(val message: String) : BleEvent
@@ -70,10 +74,14 @@ class PicoBleClient(
     private var writeCharacteristic: BluetoothGattCharacteristic? = null
     private var notifyCharacteristic: BluetoothGattCharacteristic? = null
     private var writeNoResponse = false
+    private var writeChunkBytes = WRITE_CHUNK_BYTES_DEFAULT
     private val lineAssembler = BleLineAssembler()
     private var discoveryStarted = false
+    private var mtuRequested = false
+    private var channelReady = false
     private var pendingChannel: BleChannel? = null
     @Volatile private var pendingWriteAck: CompletableDeferred<Int>? = null
+    private var connectionGeneration = 0
 
     init {
         scope.launch {
@@ -150,25 +158,55 @@ class PicoBleClient(
             return
         }
         stopScan()
-        close()
+        close(emitDisconnected = false, reason = "reconnect")
         connectedDevice = device
         discoveryStarted = false
-        onEvent(BleEvent.Log("connect ${device.name}"))
-        gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            remoteDevice.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
-        } else {
-            remoteDevice.connectGatt(context, false, gattCallback)
+        mtuRequested = false
+        channelReady = false
+        connectionGeneration++
+        val generation = connectionGeneration
+        onEvent(BleEvent.Log("connect ${device.name} ${device.address}"))
+        scope.launch {
+            delay(RECONNECT_SETTLE_MS)
+            if (generation != connectionGeneration) return@launch
+            gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                remoteDevice.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+            } else {
+                remoteDevice.connectGatt(context, false, gattCallback)
+            }
+            if (gatt == null) {
+                onEvent(BleEvent.Error("connectGatt returned null"))
+                onEvent(BleEvent.Disconnected(reason = "connect_failed"))
+                return@launch
+            }
+            delay(CONNECT_TIMEOUT_MS)
+            if (generation == connectionGeneration && !channelReady && gatt != null) {
+                onEvent(BleEvent.Error("connect timeout after ${CONNECT_TIMEOUT_MS}ms"))
+                close(emitDisconnected = true, reason = "connect_timeout")
+            }
         }
     }
 
     fun disconnect() {
         stopScan()
-        gatt?.disconnect()
-        close()
-        onEvent(BleEvent.Disconnected)
+        val current = gatt
+        if (current == null) {
+            close(emitDisconnected = true, reason = "user_disconnect")
+            return
+        }
+        current.disconnect()
+        scope.launch {
+            delay(DISCONNECT_CLOSE_MS)
+            if (gatt === current) {
+                close(emitDisconnected = true, reason = "user_disconnect")
+            }
+        }
     }
 
-    fun close() {
+    fun close() = close(emitDisconnected = false, reason = "closed")
+
+    private fun close(emitDisconnected: Boolean, reason: String, gattStatus: Int? = null, newState: Int? = null) {
+        connectionGeneration++
         synchronized(commandQueueLock) {
             commandQueue.clear()
         }
@@ -179,9 +217,15 @@ class PicoBleClient(
         writeCharacteristic = null
         notifyCharacteristic = null
         writeNoResponse = false
+        writeChunkBytes = WRITE_CHUNK_BYTES_DEFAULT
         lineAssembler.reset()
         pendingChannel = null
         discoveryStarted = false
+        mtuRequested = false
+        channelReady = false
+        if (emitDisconnected) {
+            onEvent(BleEvent.Disconnected(reason = reason, gattStatus = gattStatus, newState = newState))
+        }
     }
 
     fun sendCommand(command: String, logCommand: Boolean = true) {
@@ -261,9 +305,10 @@ class PicoBleClient(
             onEvent(BleEvent.Log("> ${command.text}"))
         }
         val bytes = "${command.text}\n".toByteArray(Charsets.UTF_8)
-        for (offset in bytes.indices step WRITE_CHUNK_BYTES) {
+        val chunkSize = writeChunkBytes
+        for (offset in bytes.indices step chunkSize) {
             if (currentGatt !== gatt) return
-            val end = minOf(offset + WRITE_CHUNK_BYTES, bytes.size)
+            val end = minOf(offset + chunkSize, bytes.size)
             val payload = bytes.copyOfRange(offset, end)
             if (!writeChunk(currentGatt, characteristic, payload)) {
                 onEvent(BleEvent.Log("write failed command=${command.text}"))
@@ -353,7 +398,7 @@ class PicoBleClient(
         return when (command.substringBefore(' ').lowercase()) {
             "stop", "s" -> CommandKind.HARD_STOP
             "softstop" -> CommandKind.SOFT_STOP
-            "f", "b", "l", "r", "drive", "keepalive" -> CommandKind.MOVEMENT
+            "f", "b", "l", "r", "drive", "keepalive", "motor", "motortest" -> CommandKind.MOVEMENT
             else -> CommandKind.REGULAR
         }
     }
@@ -370,43 +415,50 @@ class PicoBleClient(
 
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (gatt !== this@PicoBleClient.gatt) return
+            onEvent(BleEvent.Log("gatt state=$newState status=$status ${gattStatusName(status)}"))
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                onEvent(BleEvent.Error("connection status=$status"))
-                close()
-                onEvent(BleEvent.Disconnected)
+                onEvent(BleEvent.Error("connection failed state=$newState status=$status ${gattStatusName(status)}"))
+                close(emitDisconnected = true, reason = "gatt_status_$status", gattStatus = status, newState = newState)
                 return
             }
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     onEvent(BleEvent.Log("gatt connected"))
-                    if (!gatt.requestMtu(128)) {
-                        discoverServices(gatt)
+                    if (!mtuRequested) {
+                        mtuRequested = true
+                        val requested = runCatching { gatt.requestMtu(PREFERRED_MTU) }.getOrDefault(false)
+                        if (!requested) {
+                            onEvent(BleEvent.Log("mtu request rejected; using default ATT size"))
+                            discoverServices(gatt)
+                        }
                     }
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
-                    onEvent(BleEvent.Log("device disconnected"))
-                    close()
-                    onEvent(BleEvent.Disconnected)
+                    close(emitDisconnected = true, reason = "remote_disconnect", gattStatus = status, newState = newState)
                 }
             }
         }
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
             if (gatt !== this@PicoBleClient.gatt) return
-            onEvent(BleEvent.Log("mtu $mtu status=$status"))
+            onEvent(BleEvent.Log("mtu $mtu status=$status ${gattStatusName(status)}"))
+            if (status == BluetoothGatt.GATT_SUCCESS && mtu > 23) {
+                writeChunkBytes = (mtu - 3).coerceIn(18, 96)
+            }
             discoverServices(gatt)
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             if (gatt !== this@PicoBleClient.gatt) return
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                onEvent(BleEvent.Error("service discovery status=$status"))
+                onEvent(BleEvent.Error("service discovery status=$status ${gattStatusName(status)}"))
+                close(emitDisconnected = true, reason = "discover_status_$status", gattStatus = status)
                 return
             }
             val selection = pickUartChannel(gatt.services)
             if (selection == null) {
                 onEvent(BleEvent.Error("no writable notify characteristic"))
-                gatt.disconnect()
+                close(emitDisconnected = true, reason = "no_uart_characteristic")
                 return
             }
             writeCharacteristic = selection.writeChar
@@ -416,7 +468,7 @@ class PicoBleClient(
             if (!enableNotifications(gatt, selection.notifyChar)) {
                 pendingChannel = null
                 onEvent(BleEvent.Error("notify setup failed"))
-                gatt.disconnect()
+                close(emitDisconnected = true, reason = "notify_setup_failed")
             } else if (selection.notifyChar.getDescriptor(CLIENT_CONFIG_UUID) == null) {
                 notificationsReady()
             }
@@ -427,8 +479,8 @@ class PicoBleClient(
             if (status == BluetoothGatt.GATT_SUCCESS) notificationsReady()
             else {
                 pendingChannel = null
-                onEvent(BleEvent.Error("notify setup status=$status"))
-                gatt.disconnect()
+                onEvent(BleEvent.Error("notify setup status=$status ${gattStatusName(status)}"))
+                close(emitDisconnected = true, reason = "notify_status_$status", gattStatus = status)
             }
         }
 
@@ -453,6 +505,7 @@ class PicoBleClient(
     private fun notificationsReady() {
         val channel = pendingChannel ?: return
         pendingChannel = null
+        channelReady = true
         connectedDevice?.let { onEvent(BleEvent.Connected(it, channel)) }
         onEvent(BleEvent.Log("channel ${channel.serviceId} ${channel.writeCharId}"))
     }
@@ -552,6 +605,19 @@ class PicoBleClient(
 
     private infix fun Int.hasAny(mask: Int): Boolean = this and mask != 0
 
+    private fun gattStatusName(status: Int): String = when (status) {
+        BluetoothGatt.GATT_SUCCESS -> "GATT_SUCCESS"
+        8 -> "GATT_CONN_TIMEOUT"
+        19 -> "GATT_CONN_TERMINATE_PEER_USER"
+        22 -> "GATT_CONN_TERMINATE_LOCAL_HOST"
+        34 -> "GATT_CONN_LMP_TIMEOUT"
+        62 -> "GATT_CONN_FAIL_ESTABLISH"
+        133 -> "GATT_ERROR"
+        257 -> "GATT_FAILURE"
+        else -> "GATT_STATUS"
+    }
+
+
     private companion object {
         val CLIENT_CONFIG_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
         const val WRITE_PROPERTIES: Int =
@@ -560,11 +626,15 @@ class PicoBleClient(
         const val NOTIFY_PROPERTIES: Int =
             BluetoothGattCharacteristic.PROPERTY_NOTIFY or
                 BluetoothGattCharacteristic.PROPERTY_INDICATE
-        const val WRITE_CHUNK_BYTES = 18
+        const val WRITE_CHUNK_BYTES_DEFAULT = 18
         const val WRITE_ATTEMPTS = 3
         const val WRITE_ACK_TIMEOUT_MS = 1_200L
         const val WRITE_CALLBACK_SETTLE_MS = 250L
         const val WRITE_RETRY_DELAY_MS = 60L
         const val NO_RESPONSE_WRITE_GAP_MS = 35L
+        const val PREFERRED_MTU = 64
+        const val CONNECT_TIMEOUT_MS = 12_000L
+        const val RECONNECT_SETTLE_MS = 400L
+        const val DISCONNECT_CLOSE_MS = 1_200L
     }
 }

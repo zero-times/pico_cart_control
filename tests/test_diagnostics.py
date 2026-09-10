@@ -73,7 +73,7 @@ class DiagnosticsTests(unittest.TestCase):
         rows = [fields(log.next_export_line()) for _ in range(3)]
         self.assertEqual([r["u"] for r in rows], ["0", "1800000000000", "1800000000020"])
         self.assertEqual([r["t"] for r in rows], ["0", "50", "70"])
-        self.assertTrue(all(r["fw"] == "0.2.0" for r in rows))
+        self.assertTrue(all(r["fw"] == fw.FIRMWARE_VERSION for r in rows))
 
     def test_ring_capacity_warning_and_overwrite_accounting(self):
         log = fw.HardwareLogger()
@@ -146,7 +146,7 @@ class DiagnosticsTests(unittest.TestCase):
         log = fw.HardwareLogger()
         log.usb = Mock()
         controller = Mock(hardware_log=log)
-        controller.info_line.return_value = "info fw=0.2.0"
+        controller.info_line.return_value = "info fw=" + fw.FIRMWARE_VERSION
         controller.status_line.return_value = "stat mode=idle"
         return fw.CommandInterface(controller, Mock(), Mock()), log
 
@@ -233,6 +233,53 @@ class DiagnosticsTests(unittest.TestCase):
         usb.stdout.write.assert_not_called()
         usb.output_poll.poll.assert_called_with(0)
 
+    def test_state_debounce_ignores_brief_glitch_then_accepts_real_drop(self):
+        global now
+        now = 1000
+        ble = self.make_ble()
+        ble.state = Mock()
+        ble.state.value.return_value = 1
+        ble.last_connected = 1
+        ble.raw_connected = 1
+        ble.raw_changed_ms = now
+        ble.state.value.return_value = 0
+        self.assertIsNone(ble.connection_event())
+        now += fw.BLE_STATE_DEBOUNCE_MS - 1
+        self.assertIsNone(ble.connection_event())
+        now += 2
+        self.assertEqual(ble.connection_event(), 0)
+        self.assertEqual(ble.last_connected, 0)
+
+    def test_motor_test_does_not_block_stop_or_disconnect(self):
+        global now
+        now = 0
+        controller = fw.CartController.__new__(fw.CartController)
+        controller.front_obstacle = Mock(blocked=False)
+        controller.left_motor = Mock()
+        controller.right_motor = Mock()
+        controller.hardware_log = fw.HardwareLogger()
+        controller.mode = fw.MODE_IDLE
+        controller.manual_left = 0.0
+        controller.manual_right = 0.0
+        controller.pending_manual_left = 0.0
+        controller.pending_manual_right = 0.0
+        controller.reverse_state = ""
+        controller.soft_stop_pending = False
+        controller.soft_stop_reason = ""
+        controller.tow_armed = False
+        controller.tow_left_force = 0.0
+        controller.tow_right_force = 0.0
+        controller.last_manual_ms = 0
+        controller.drive_status = "idle"
+        self.assertTrue(controller.start_motor_test(0.18, 0.0, 1500))
+        self.assertEqual(controller.mode, fw.MODE_MANUAL)
+        self.assertTrue(controller.motor_test_active())
+        controller.stop(fw.MODE_IDLE, "ble_disconnect")
+        self.assertFalse(controller.motor_test_active())
+        self.assertEqual(controller.mode, fw.MODE_IDLE)
+        controller.left_motor.stop.assert_called()
+        controller.right_motor.stop.assert_called()
+
     def test_usb_partial_output_and_drop_accounting(self):
         usb = fw.UsbDiagnostics.__new__(fw.UsbDiagnostics)
         usb.stdout, usb.output_poll = Mock(), Mock()
@@ -249,7 +296,7 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertFalse(usb.write("overflow"))
         for _ in range(100):
             usb.flush()
-        self.assertEqual("".join(output), "sample\n" * fw.DIAGNOSTIC_QUEUE_CAPACITY + "usb_dropped n=1 fw=0.2.0\n")
+        self.assertEqual("".join(output), "sample\n" * fw.DIAGNOSTIC_QUEUE_CAPACITY + "usb_dropped n=1 fw=" + fw.FIRMWARE_VERSION + "\n")
 
 
 if __name__ == "__main__":

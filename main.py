@@ -37,8 +37,10 @@ BLE_UART_BAUD = 115200
 BLE_STATE_PIN = 15
 BLE_STATE_ACTIVE_HIGH = True
 BLE_LINE_MAX = 160
-PROTOCOL_VERSION = "pico-cart-ble-2026-09-10-diag"
-FIRMWARE_VERSION = "0.2.0"
+# Ignore STATE pin glitches; a real drop still stops well before timeout_ms.
+BLE_STATE_DEBOUNCE_MS = 80
+PROTOCOL_VERSION = "pico-cart-ble-2026-09-10-ble"
+FIRMWARE_VERSION = "0.2.1"
 
 # HX711 modules. Each S-type load cell uses one HX711.
 LEFT_HX711_DOUT = 6
@@ -227,6 +229,8 @@ class BluetoothSerial:
         self.state = None
         self.buffer = ""
         self.last_connected = -1
+        self.raw_connected = -1
+        self.raw_changed_ms = ticks_ms()
         self.hardware_log = None
         self.tx_queue = []
         self.tx_offset = 0
@@ -250,7 +254,9 @@ class BluetoothSerial:
 
         try:
             self.state = Pin(BLE_STATE_PIN, Pin.IN)
-            self.last_connected = self.connected()
+            self.raw_connected = self.connected()
+            self.last_connected = self.raw_connected
+            self.raw_changed_ms = ticks_ms()
         except Exception as err:
             print("ble_state_error={}".format(err))
             self.state = None
@@ -268,10 +274,18 @@ class BluetoothSerial:
 
     def connection_event(self):
         now = self.connected()
-        if now != self.last_connected:
+        if now != self.raw_connected:
+            self.raw_connected = now
+            self.raw_changed_ms = ticks_ms()
+        if now == self.last_connected:
+            return None
+        if now == -1:
             self.last_connected = now
             return now
-        return None
+        if ticks_diff(ticks_ms(), self.raw_changed_ms) < BLE_STATE_DEBOUNCE_MS:
+            return None
+        self.last_connected = now
+        return now
 
     def record_error(self, event, detail):
         now = ticks_ms()
@@ -942,6 +956,50 @@ class CartController:
         self.tow_right_baseline = 0.0
         self.tow_left_force = 0.0
         self.tow_right_force = 0.0
+        self.motor_test_until = 0
+        self.motor_test_left = 0.0
+        self.motor_test_right = 0.0
+        self.motor_test_running = False
+
+    def clear_motor_test(self):
+        self.motor_test_until = 0
+        self.motor_test_left = 0.0
+        self.motor_test_right = 0.0
+        self.motor_test_running = False
+
+    def motor_test_active(self, now=None):
+        if not self.motor_test_running:
+            return False
+        now = ticks_ms() if now is None else now
+        return ticks_diff(self.motor_test_until, now) > 0
+
+    def start_motor_test(self, left, right, duration_ms):
+        left = clamp(left, -MANUAL_MAX_PWM, MANUAL_MAX_PWM)
+        right = clamp(right, -MANUAL_MAX_PWM, MANUAL_MAX_PWM)
+        if self.front_blocks_targets(left, right):
+            self.front_obstacle_stop()
+            self.hardware_log.event("drive_rejected", "reason=front_obstacle")
+            return False
+        now = ticks_ms()
+        self.mode = MODE_MANUAL
+        self.motor_test_left = left
+        self.motor_test_right = right
+        self.motor_test_until = ticks_add(now, duration_ms)
+        self.motor_test_running = True
+        self.manual_left = left
+        self.manual_right = right
+        self.pending_manual_left = 0.0
+        self.pending_manual_right = 0.0
+        self.reverse_state = ""
+        self.soft_stop_pending = False
+        self.soft_stop_reason = ""
+        self.last_manual_ms = now
+        self.drive_status = "motor_test"
+        self.hardware_log.event(
+            "motor_test",
+            "l={:.2f} r={:.2f} ms={}".format(left, right, duration_ms),
+        )
+        return True
 
     def stop(self, mode=MODE_IDLE, reason="stop"):
         self.mode = mode
@@ -956,6 +1014,7 @@ class CartController:
         self.tow_armed = False
         self.tow_left_force = 0.0
         self.tow_right_force = 0.0
+        self.clear_motor_test()
         self.left_motor.stop()
         self.right_motor.stop()
         self.hardware_log.event("stop", "reason={} mode={}".format(reason, mode))
@@ -971,6 +1030,7 @@ class CartController:
         self.soft_stop_pending = False
         self.soft_stop_reason = ""
         self.tow_armed = False
+        self.clear_motor_test()
         if self.mode == MODE_MANUAL:
             self.mode = MODE_IDLE
         self.drive_status = "front_obstacle"
@@ -1072,6 +1132,7 @@ class CartController:
             self.hardware_log.event("drive_rejected", "reason=front_obstacle")
             return False
         now = ticks_ms()
+        self.clear_motor_test()
         self.mode = MODE_MANUAL
         self.last_manual_ms = now
         self.soft_stop_pending = False
@@ -1128,6 +1189,7 @@ class CartController:
         )
 
     def enter_manual(self):
+        self.clear_motor_test()
         self.mode = MODE_MANUAL
         self.manual_left = 0.0
         self.manual_right = 0.0
@@ -1156,6 +1218,7 @@ class CartController:
         self.drive_status = "calibrating"
         self.left_motor.stop()
         self.right_motor.stop()
+        self.clear_motor_test()
         self.hardware_log.event("mode", "to=tow")
         return True
 
@@ -1186,6 +1249,7 @@ class CartController:
             self.manual_left = 0.0
             self.manual_right = 0.0
             self.tow_armed = False
+            self.clear_motor_test()
             self.drive_status = "idle"
             self.left_motor.ramp_to(0.0, now)
             self.right_motor.ramp_to(0.0, now)
@@ -1217,7 +1281,12 @@ class CartController:
                 "front_obstacle" if self.front_obstacle.blocked else "idle"
             )
         elif self.mode == MODE_MANUAL:
-            if (not self.soft_stop_pending and
+            if self.motor_test_running and not self.motor_test_active(now):
+                self.clear_motor_test()
+                self.stop(MODE_IDLE, "motor_test_done")
+                self.observe_hardware(now)
+                return
+            if (not self.soft_stop_pending and not self.motor_test_until and
                     ticks_diff(now, self.last_manual_ms) > MANUAL_TIMEOUT_MS):
                 # Dead-man expiry is a controlled stop, not a hardware fault.
                 self.hardware_log.event(
@@ -1256,6 +1325,10 @@ class CartController:
                 left_target = self.manual_left
                 right_target = self.manual_right
                 self.drive_status = "active"
+            if self.motor_test_running:
+                left_target = self.motor_test_left
+                right_target = self.motor_test_right
+                self.drive_status = "motor_test"
             self.total = self.left_force + self.right_force
             self.steer = 0.0
         else:
@@ -1534,35 +1607,15 @@ class CommandInterface:
             self.reply("err motor_side")
             return
 
-        self.controller.stop(MODE_IDLE)
+        if not self.controller.start_motor_test(left_target, right_target, duration_ms):
+            self.reply("err front_obstacle")
+            return
         self.status_led.identify(duration_ms)
         self.reply(
             "ok motor side={} dir={} power={:.2f} ms={}".format(
                 side, direction, power, duration_ms
             )
         )
-
-        start = ticks_ms()
-        while ticks_diff(ticks_ms(), start) < duration_ms:
-            self.controller.front_obstacle.update(ticks_ms())
-            if self.controller.estop.value() == 0:
-                self.controller.left_motor.stop()
-                self.controller.right_motor.stop()
-                self.reply("err estop")
-                return
-            if self.controller.front_blocks_targets(left_target, right_target):
-                self.controller.left_motor.stop()
-                self.controller.right_motor.stop()
-                self.reply("err front_obstacle")
-                return
-            self.controller.left_motor.ramp_to(left_target)
-            self.controller.right_motor.ramp_to(right_target)
-            self.status_led.update(ticks_ms())
-            sleep_ms(LOOP_MS)
-
-        self.controller.left_motor.stop()
-        self.controller.right_motor.stop()
-        self.reply("ok motor_done")
 
     def handle_set(self, parts):
         global MAX_PWM, MIN_MOVE_PWM, PULL_START_RAW, PULL_FULL_RAW
@@ -1735,6 +1788,8 @@ class CommandInterface:
             elif command == "keepalive":
                 # Intentionally no success reply: this high-rate lease refresh must
                 # not compete with status notifications on the UART bridge.
+                if self.controller.motor_test_running:
+                    return
                 if not self.controller.refresh_manual_lease():
                     self.reply("err keepalive_inactive")
             elif command == "tare":
@@ -1886,8 +1941,8 @@ def main():
             if connection_event == 1:
                 ble.reset_connection_buffers()
                 hardware_log.event("ble_connect", "state=1 cause=unknown")
-                if controller.mode == MODE_AUTO:
-                    controller.stop(MODE_IDLE, "ble_connect_auto_reset")
+                if controller.mode in (MODE_AUTO, MODE_MANUAL) or controller.motor_test_running:
+                    controller.stop(MODE_IDLE, "ble_connect_reset")
                 commands.send_hello()
             elif connection_event == 0:
                 ble.reset_connection_buffers()
@@ -1895,7 +1950,7 @@ def main():
                     hardware_log.cancel_export()
                     hardware_log.event("hwlog_interrupted", "reason=ble_disconnect")
                 hardware_log.event("ble_disconnect", "state=0 cause=unknown")
-                if controller.mode == MODE_MANUAL or controller.mode == MODE_AUTO:
+                if controller.mode in (MODE_MANUAL, MODE_AUTO) or controller.motor_test_running:
                     controller.stop(MODE_IDLE, "ble_disconnect")
 
             for line in ble.poll_lines():

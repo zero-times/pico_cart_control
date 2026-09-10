@@ -112,6 +112,7 @@ function pageHarness(options) {
   page.data = JSON.parse(JSON.stringify(page.data))
   page.setData = (data) => Object.assign(page.data, data)
   page.onLoad()
+  page.enqueueCommand = page.sendCommand.bind(page)
   page.sendCommand = async (command) => { commands.push(command); return true }
   page.pickUartChannel = async () => ({ serviceId: 'service', writeCharId: 'write', notifyCharId: 'notify', writeProperties: {} })
   page.data.connected = true
@@ -232,4 +233,17 @@ test('explicit and custom cleanup require confirmation; a canceled dialog sends 
   await settle()
   assert.equal(h.modals.length, 2)
   assert.deepEqual(h.commands, [])
+})
+
+test('stop jumps ahead of queued work and disconnect drops leftover motion commands', () => {
+  const h = pageHarness()
+  h.page.data.connected = true
+  h.page.writeBusy = true
+  h.page.enqueueCommand('hwlog dump')
+  h.page.enqueueCommand('f 0.16')
+  h.page.enqueueCommand('keepalive')
+  h.page.enqueueCommand('stop')
+  assert.equal(h.page.commandQueue.map((entry) => entry.command).join('|'), 'stop|hwlog dump')
+  h.page.invalidateConnection('test disconnect')
+  assert.equal(h.page.commandQueue.length, 0)
 })

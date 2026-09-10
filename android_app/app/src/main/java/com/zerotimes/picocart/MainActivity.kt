@@ -829,6 +829,8 @@ private fun HeaderStatusLine(label: String, ok: Boolean, warning: Boolean = fals
 private fun PicoConnectionAlert(state: CartUiState) {
     val timedOut = state.connected && state.picoHeartbeatStatus == "Pico 心跳超时"
     val message = when {
+        !state.connected && state.linkStatus.startsWith("已断开") ->
+            "${state.linkStatus}${if (state.lastGattStatus.isNotBlank()) "（${state.lastGattStatus}）" else ""}。请手动重连，重连后不会自动继续行驶。"
         !state.connected -> "请初始化蓝牙并扫描连接 Pico。控制命令保持锁定。"
         timedOut -> "心跳已超时。请检查供电与距离，恢复心跳后控制会自动解锁。"
         else -> "正在校验 Pico 心跳，确认设备安全后控制会自动解锁。"
@@ -846,7 +848,11 @@ private fun PicoConnectionAlert(state: CartUiState) {
             Icon(Icons.Filled.Warning, contentDescription = null, modifier = Modifier.size(24.dp))
             Column {
                 Text(
-                    if (timedOut) "Pico 心跳中断" else "恢复控制连接",
+                    when {
+                        timedOut -> "Pico 心跳中断"
+                        !state.connected && state.linkStatus.startsWith("已断开") -> "蓝牙已断开"
+                        else -> "恢复控制连接"
+                    },
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.Bold,
                 )
@@ -1609,6 +1615,10 @@ private fun DebugActionSection(
         Spacer(Modifier.height(10.dp))
         Text("固件版本：${state.firmwareVersion} · 时钟：${state.clockSyncStatus}",
             style = MaterialTheme.typography.bodySmall)
+        if (state.linkStatus.isNotBlank()) {
+            Text("连接：${state.linkStatus}${if (state.lastGattStatus.isNotBlank()) " · ${state.lastGattStatus}" else ""}",
+                style = MaterialTheme.typography.bodySmall)
+        }
         Text(
             if (state.hardwareLogUsedPercent == null) "Pico 日志 RAM：待读取"
             else "Pico 日志 RAM：${state.hardwareLogUsed}/${state.hardwareLogCapacity} 条（${state.hardwareLogUsedPercent}%），已覆盖 ${state.hardwareLogOverwritten} 条",
