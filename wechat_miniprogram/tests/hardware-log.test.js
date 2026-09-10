@@ -134,7 +134,7 @@ test('notification-ready initialization sends time sync first; reconnect has one
   h.page.data.connected = false
   assert.equal(await h.page.connectDevice({ deviceId: 'pico', name: 'Test' }), true)
   assert.match(h.commands[0], /^time sync \d+$/)
-  assert.deepEqual(h.commands.slice(1), ['info', 'hwlog status', 'status', 'param'])
+  assert.deepEqual(h.commands.slice(1), ['info', 'hwlog status', 'status', 'param', 'cal status'])
   h.page.startDiagnosticsPolling()
   assert.equal(Array.from(h.timers.values()).filter((timer) => timer.interval).length, 1)
   h.page.onUnload()

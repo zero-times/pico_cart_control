@@ -292,6 +292,11 @@ private fun PicoCartApp(
         onDriveRelease = { viewModel.releaseDrive() },
         onParamInput = viewModel::updateParam,
         onApplyParam = viewModel::applyParam,
+        onRefreshCalibration = viewModel::refreshCalibration,
+        onSaveMotorCalibration = viewModel::saveMotorCalibration,
+        onTestLeftWheel = viewModel::testLeftWheel,
+        onTestRightWheel = viewModel::testRightWheel,
+        onTestStraight = viewModel::testStraight,
         onCustomInput = viewModel::updateCustomCommand,
         onSendCustom = viewModel::sendCustom,
         onCopyLogs = { viewModel.copyLogs(context) },
@@ -358,6 +363,11 @@ private fun PicoCartScreen(
     onDriveRelease: () -> Unit,
     onParamInput: (String, String) -> Unit,
     onApplyParam: (String) -> Unit,
+    onRefreshCalibration: () -> Unit,
+    onSaveMotorCalibration: () -> Unit,
+    onTestLeftWheel: () -> Unit,
+    onTestRightWheel: () -> Unit,
+    onTestStraight: () -> Unit,
     onCustomInput: (String) -> Unit,
     onSendCustom: () -> Unit,
     onCopyLogs: () -> Unit,
@@ -562,6 +572,16 @@ private fun PicoCartScreen(
                             )
                         }
                         item {
+                            WheelCalibrationSection(
+                                state = state,
+                                onRefreshCalibration = onRefreshCalibration,
+                                onSaveMotorCalibration = onSaveMotorCalibration,
+                                onTestLeftWheel = onTestLeftWheel,
+                                onTestRightWheel = onTestRightWheel,
+                                onTestStraight = onTestStraight,
+                                onParamInput = onParamInput,
+                                onApplyParam = onApplyParam,
+                            )
                             ParamsSection(
                                 state = state,
                                 onParamQuery = onParamQuery,
@@ -2175,6 +2195,54 @@ private fun DriveButton(
             Icon(icon, contentDescription = null, modifier = Modifier.size(20.dp))
             ButtonGap()
             Text(label, fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
+@Composable
+private fun WheelCalibrationSection(
+    state: CartUiState,
+    onRefreshCalibration: () -> Unit,
+    onSaveMotorCalibration: () -> Unit,
+    onTestLeftWheel: () -> Unit,
+    onTestRightWheel: () -> Unit,
+    onTestStraight: () -> Unit,
+    onParamInput: (String, String) -> Unit,
+    onApplyParam: (String) -> Unit,
+) {
+    Section(title = "轮速校准") {
+        Text("先停车，再分别点左/右轮低速试转，微调增益后短距直行对比，最后保存。未保存的改动断电会丢失。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.height(8.dp))
+        Text("当前增益：左 ${state.paramInputs["left_motor_gain"] ?: "-"} / 右 ${state.paramInputs["right_motor_gain"] ?: "-"}",
+            style = MaterialTheme.typography.bodySmall)
+        Text("已保存：左 ${state.savedLeftMotorGain} / 右 ${state.savedRightMotorGain}",
+            style = MaterialTheme.typography.bodySmall)
+        Text(state.calibrationStatus, style = MaterialTheme.typography.bodySmall)
+        Spacer(Modifier.height(8.dp))
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            ActionButton("刷新校准", Icons.Filled.Refresh, onRefreshCalibration, enabled = state.cartReady)
+            ActionButton("试左轮", Icons.Filled.PlayArrow, onTestLeftWheel, enabled = state.cartReady)
+            ActionButton("试右轮", Icons.Filled.PlayArrow, onTestRightWheel, enabled = state.cartReady)
+            ActionButton("短距直行", Icons.Filled.PlayArrow, onTestStraight, enabled = state.cartReady)
+            ActionButton(if (state.calibrationSaving) "保存中" else "停车并保存", Icons.Filled.Save,
+                onSaveMotorCalibration, enabled = state.cartReady && !state.calibrationSaving)
+        }
+        Spacer(Modifier.height(8.dp))
+        listOf("left_motor_gain", "right_motor_gain").forEach { key ->
+            OutlinedTextField(
+                value = state.paramInputs[key].orEmpty(),
+                onValueChange = { onParamInput(key, it) },
+                label = { Text(PicoProtocol.parameterLabel(key)) },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                trailingIcon = {
+                    TextButton(onClick = { onApplyParam(key) }, enabled = state.cartReady) { Text("写入") }
+                },
+            )
+            Spacer(Modifier.height(8.dp))
         }
     }
 }

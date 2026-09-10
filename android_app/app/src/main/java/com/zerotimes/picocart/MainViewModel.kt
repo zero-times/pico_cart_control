@@ -101,6 +101,10 @@ data class CartUiState(
     val hardwareLogStatus: String = "未导出",
     val linkStatus: String = "未连接",
     val lastGattStatus: String = "",
+    val calibrationStatus: String = "未读取校准状态",
+    val calibrationSaving: Boolean = false,
+    val savedLeftMotorGain: String = "-",
+    val savedRightMotorGain: String = "-",
     val gamepadState: GamepadState = GamepadState(),
 ) {
     val cartReady: Boolean
@@ -430,6 +434,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             sendCommand("set $key $value")
         }
     }
+
+    fun refreshCalibration() = sendCommand("cal status")
+
+    fun saveMotorCalibration() {
+        if (_uiState.value.calibrationSaving) return
+        if (!sendCommand("stop")) return
+        if (!sendCommand("cal save motor")) return
+        _uiState.update { it.copy(calibrationSaving = true, calibrationStatus = "正在停车并保存轮速增益") }
+    }
+
+    fun testLeftWheel() = sendCommand("motor left f 0.16 800")
+
+    fun testRightWheel() = sendCommand("motor right f 0.16 800")
+
+    fun testStraight() = sendCommand("f 0.16")
 
     fun updateCustomCommand(value: String) {
         _uiState.update { it.copy(customCommand = value) }
@@ -835,6 +854,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             requestHeartbeat()
             delay(120)
             client.sendCommand("param")
+            client.sendCommand("cal status")
             if (identifyAfterConnected) {
                 delay(200)
                 identifyAfterConnected = false
@@ -886,6 +906,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             hardwareLogClearTimeoutJob?.cancel()
             _uiState.update { it.copy(hardwareLogClearBusy = false, hardwareLogStatus = "操作失败：$line") }
         }
+        if (parsed.type == "err" && line.contains("cal")) {
+            _uiState.update { it.copy(calibrationSaving = false, calibrationStatus = "保存失败：$line") }
+        }
         if (parsed.type != "stat") {
             addLog("< $line")
         }
@@ -911,7 +934,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 parsed["stream"]?.let { stream ->
                     _uiState.update { it.copy(streaming = stream == "on") }
                 }
-
+                if (line.startsWith("ok cal_save ")) {
+                    _uiState.update {
+                        it.copy(
+                            calibrationSaving = false,
+                            calibrationStatus = "已保存左右轮增益 ${parsed["left_motor_gain"] ?: "-"} / ${parsed["right_motor_gain"] ?: "-"}",
+                            savedLeftMotorGain = parsed["left_motor_gain"] ?: it.savedLeftMotorGain,
+                            savedRightMotorGain = parsed["right_motor_gain"] ?: it.savedRightMotorGain,
+                        )
+                    }
+                }
+            }
+            "cal" -> _uiState.update {
+                it.copy(
+                    calibrationSaving = false,
+                    calibrationStatus = if (parsed["err"].isNullOrBlank() || parsed["err"] == "-") {
+                        "已保存=${if (parsed["loaded"] == "1") "是" else "否"}，未保存改动=${if (parsed["dirty"] == "1") "有" else "无"}"
+                    } else {
+                        "校准文件不可用：${parsed["err"]}"
+                    },
+                    savedLeftMotorGain = parsed["saved_left_motor_gain"] ?: it.savedLeftMotorGain,
+                    savedRightMotorGain = parsed["saved_right_motor_gain"] ?: it.savedRightMotorGain,
+                )
             }
         }
     }

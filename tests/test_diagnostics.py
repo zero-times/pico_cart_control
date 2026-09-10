@@ -280,6 +280,36 @@ class DiagnosticsTests(unittest.TestCase):
         controller.left_motor.stop.assert_called()
         controller.right_motor.stop.assert_called()
 
+    def test_calibration_save_keeps_other_group_and_rejects_motion(self):
+        store = fw.CalibrationStore(path="_cal_test.cfg", temp_path="_cal_test.cfg.tmp")
+        motor = fw.apply_calibration_values({"left_motor_gain": 0.9, "right_motor_gain": 1.1})
+        self.assertEqual(round(motor["left_motor_gain"], 2), 0.9)
+        saved = store.save(fw.current_calibration_values())
+        self.assertEqual(saved["left_motor_gain"], fw.LEFT_MOTOR_GAIN)
+        fw.apply_calibration_values({"left_force_gain": 1.4, "start_raw": 20000, "full_raw": 160000})
+        values = dict(store.saved)
+        for name in fw.CALIBRATION_GROUPS["force"]:
+            values[name] = fw.current_calibration_values()[name]
+        store.save(values)
+        reloaded = store.load()
+        self.assertEqual(reloaded["left_motor_gain"], 0.9)
+        self.assertEqual(reloaded["left_force_gain"], 1.4)
+        self.assertEqual(reloaded["start_raw"], 20000)
+        corrupt = Path("_cal_bad.cfg")
+        corrupt.write_text("fmt=1\nleft_motor_gain=oops\n")
+        bad = fw.CalibrationStore(path=str(corrupt), temp_path="_cal_bad.cfg.tmp")
+        self.assertIsNone(bad.load())
+        self.assertEqual(bad.last_error, "bad_value")
+        interface, log = self.make_interface()
+        interface.controller.mode = fw.MODE_MANUAL
+        interface.controller.motors_stopped.return_value = False
+        interface.controller.calibration = store
+        interface.handle("cal save motor")
+        interface.controller.stop.assert_called()
+        self.assertEqual(interface.ble.write.call_args.args[0], "err cal_not_idle")
+        self.addCleanup(lambda: [Path(name).unlink(missing_ok=True) for name in (
+            "_cal_test.cfg", "_cal_test.cfg.tmp", "_cal_bad.cfg", "_cal_bad.cfg.tmp")])
+
     def test_usb_partial_output_and_drop_accounting(self):
         usb = fw.UsbDiagnostics.__new__(fw.UsbDiagnostics)
         usb.stdout, usb.output_poll = Mock(), Mock()

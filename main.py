@@ -1,5 +1,6 @@
 from machine import Pin, PWM, UART
 from time import sleep_ms, ticks_ms, ticks_diff, ticks_add
+import os
 import sys
 
 try:
@@ -39,8 +40,8 @@ BLE_STATE_ACTIVE_HIGH = True
 BLE_LINE_MAX = 160
 # Ignore STATE pin glitches; a real drop still stops well before timeout_ms.
 BLE_STATE_DEBOUNCE_MS = 80
-PROTOCOL_VERSION = "pico-cart-ble-2026-09-10-ble"
-FIRMWARE_VERSION = "0.2.1"
+PROTOCOL_VERSION = "pico-cart-ble-2026-09-10-cal"
+FIRMWARE_VERSION = "0.2.2"
 
 # HX711 modules. Each S-type load cell uses one HX711.
 LEFT_HX711_DOUT = 6
@@ -155,6 +156,9 @@ FRONT_OBSTACLE_CLEAR_MS = 400
 # Hardware diagnostics stay in RAM so a driving cart never blocks on Pico flash
 # writes. The Android app can request the ring buffer through the BLE UART.
 HARDWARE_LOG_CAPACITY = 192
+CALIBRATION_PATH = "pico_cart_cal.cfg"
+CALIBRATION_TEMP_PATH = "pico_cart_cal.cfg.tmp"
+CALIBRATION_FORMAT = 1
 HARDWARE_LOG_SNAPSHOT_MS = 250
 HARDWARE_LOG_OVERRUN_MS = 100
 HARDWARE_LOG_OVERRUN_REPEAT_MS = 1000
@@ -189,6 +193,208 @@ def clamp(value, low, high):
     if value > high:
         return high
     return value
+
+
+MOTOR_GAIN_MIN = 0.50
+MOTOR_GAIN_MAX = 1.20
+FORCE_GAIN_MIN = 0.20
+FORCE_GAIN_MAX = 3.00
+CALIBRATION_GROUPS = {
+    "motor": ("left_motor_gain", "right_motor_gain"),
+    "force": ("left_force_gain", "right_force_gain", "start_raw", "full_raw", "tow_left_comp", "tow_right_comp"),
+}
+CALIBRATION_FIELDS = (
+    CALIBRATION_GROUPS["motor"] + CALIBRATION_GROUPS["force"]
+)
+
+
+def default_calibration_values():
+    return {
+        "left_motor_gain": 1.0,
+        "right_motor_gain": 1.0,
+        "left_force_gain": 1.0,
+        "right_force_gain": 1.0,
+        "start_raw": 25000,
+        "full_raw": 180000,
+        "tow_left_comp": 0,
+        "tow_right_comp": 0,
+    }
+
+
+def current_calibration_values():
+    return {
+        "left_motor_gain": LEFT_MOTOR_GAIN,
+        "right_motor_gain": RIGHT_MOTOR_GAIN,
+        "left_force_gain": LEFT_FORCE_GAIN,
+        "right_force_gain": RIGHT_FORCE_GAIN,
+        "start_raw": PULL_START_RAW,
+        "full_raw": PULL_FULL_RAW,
+        "tow_left_comp": TOW_LEFT_COMP_RAW,
+        "tow_right_comp": TOW_RIGHT_COMP_RAW,
+    }
+
+
+def format_calibration_value(name, value):
+    if name in ("start_raw", "full_raw", "tow_left_comp", "tow_right_comp"):
+        return str(int(value))
+    if name in ("left_motor_gain", "right_motor_gain", "left_force_gain", "right_force_gain"):
+        return "{:.2f}".format(value)
+    return str(value)
+
+
+def validate_calibration_value(name, value):
+    try:
+        if name in ("left_motor_gain", "right_motor_gain"):
+            return clamp(float(value), MOTOR_GAIN_MIN, MOTOR_GAIN_MAX)
+        if name in ("left_force_gain", "right_force_gain"):
+            return clamp(float(value), FORCE_GAIN_MIN, FORCE_GAIN_MAX)
+        if name == "start_raw":
+            return int(max(0, float(value)))
+        if name == "full_raw":
+            return int(max(1, float(value)))
+        if name in ("tow_left_comp", "tow_right_comp"):
+            return int(clamp(float(value), 0, MAX_SAFE_RAW))
+    except (TypeError, ValueError):
+        raise ValueError("bad_value")
+    raise ValueError("unknown_field")
+
+
+def apply_calibration_values(values, source="runtime"):
+    global LEFT_MOTOR_GAIN, RIGHT_MOTOR_GAIN, LEFT_FORCE_GAIN, RIGHT_FORCE_GAIN
+    global PULL_START_RAW, PULL_FULL_RAW, TOW_LEFT_COMP_RAW, TOW_RIGHT_COMP_RAW
+    applied = {}
+    if "left_motor_gain" in values:
+        LEFT_MOTOR_GAIN = validate_calibration_value("left_motor_gain", values["left_motor_gain"])
+        applied["left_motor_gain"] = LEFT_MOTOR_GAIN
+    if "right_motor_gain" in values:
+        RIGHT_MOTOR_GAIN = validate_calibration_value("right_motor_gain", values["right_motor_gain"])
+        applied["right_motor_gain"] = RIGHT_MOTOR_GAIN
+    if "left_force_gain" in values:
+        LEFT_FORCE_GAIN = validate_calibration_value("left_force_gain", values["left_force_gain"])
+        applied["left_force_gain"] = LEFT_FORCE_GAIN
+    if "right_force_gain" in values:
+        RIGHT_FORCE_GAIN = validate_calibration_value("right_force_gain", values["right_force_gain"])
+        applied["right_force_gain"] = RIGHT_FORCE_GAIN
+    start_raw = validate_calibration_value("start_raw", values.get("start_raw", PULL_START_RAW))
+    full_raw = validate_calibration_value("full_raw", values.get("full_raw", PULL_FULL_RAW))
+    if full_raw <= start_raw:
+        if source == "file":
+            raise ValueError("threshold_order")
+        full_raw = start_raw + 1
+    if "start_raw" in values or "full_raw" in values:
+        PULL_START_RAW = start_raw
+        PULL_FULL_RAW = full_raw
+        applied["start_raw"] = PULL_START_RAW
+        applied["full_raw"] = PULL_FULL_RAW
+    if "tow_left_comp" in values:
+        TOW_LEFT_COMP_RAW = validate_calibration_value("tow_left_comp", values["tow_left_comp"])
+        applied["tow_left_comp"] = TOW_LEFT_COMP_RAW
+    if "tow_right_comp" in values:
+        TOW_RIGHT_COMP_RAW = validate_calibration_value("tow_right_comp", values["tow_right_comp"])
+        applied["tow_right_comp"] = TOW_RIGHT_COMP_RAW
+    return applied
+
+
+class CalibrationStore:
+    def __init__(self, path=CALIBRATION_PATH, temp_path=CALIBRATION_TEMP_PATH):
+        self.path = path
+        self.temp_path = temp_path
+        self.loaded = False
+        self.last_error = ""
+        self.saved = dict(default_calibration_values())
+
+    def encode(self, values):
+        lines = ["fmt={}".format(CALIBRATION_FORMAT), "fw={}".format(FIRMWARE_VERSION)]
+        for name in CALIBRATION_FIELDS:
+            lines.append("{}={}".format(name, format_calibration_value(name, values[name])))
+        return "\n".join(lines) + "\n"
+
+    def parse(self, text):
+        values = {}
+        fmt = None
+        for raw in text.replace("\r", "\n").split("\n"):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                raise ValueError("bad_line")
+            name, value = line.split("=", 1)
+            name = name.strip().lower()
+            value = value.strip()
+            if name == "fmt":
+                fmt = int(value)
+                continue
+            if name == "fw":
+                continue
+            if name not in CALIBRATION_FIELDS:
+                continue
+            values[name] = validate_calibration_value(name, value)
+        if fmt != CALIBRATION_FORMAT:
+            raise ValueError("bad_format")
+        for name in CALIBRATION_FIELDS:
+            if name not in values:
+                raise ValueError("missing_" + name)
+        if values["full_raw"] <= values["start_raw"]:
+            raise ValueError("threshold_order")
+        return values
+
+    def load(self):
+        try:
+            with open(self.path, "r") as handle:
+                text = handle.read()
+        except OSError:
+            self.last_error = "missing"
+            self.loaded = False
+            return None
+        try:
+            values = self.parse(text)
+        except Exception as err:
+            self.last_error = str(err) or "corrupt"
+            self.loaded = False
+            return None
+        self.saved = values
+        self.loaded = True
+        self.last_error = ""
+        return values
+
+    def save(self, values):
+        text = self.encode(values)
+        try:
+            with open(self.temp_path, "w") as handle:
+                handle.write(text)
+                handle.flush()
+            os.rename(self.temp_path, self.path)
+        except OSError as err:
+            try:
+                os.remove(self.temp_path)
+            except OSError:
+                pass
+            raise OSError(str(err) or "write_failed")
+        self.saved = dict(values)
+        self.loaded = True
+        self.last_error = ""
+        return self.saved
+
+    def status_line(self):
+        dirty = 0
+        current = current_calibration_values()
+        for name in CALIBRATION_FIELDS:
+            if abs(float(current[name]) - float(self.saved[name])) > 0.0005:
+                dirty = 1
+        return (
+            "cal fmt={} loaded={} dirty={} err={} "
+            "left_motor_gain={} right_motor_gain={} "
+            "saved_left_motor_gain={} saved_right_motor_gain={}"
+        ).format(
+            CALIBRATION_FORMAT,
+            "1" if self.loaded else "0",
+            dirty,
+            self.last_error or "-",
+            format_calibration_value("left_motor_gain", current["left_motor_gain"]),
+            format_calibration_value("right_motor_gain", current["right_motor_gain"]),
+            format_calibration_value("left_motor_gain", self.saved["left_motor_gain"]),
+            format_calibration_value("right_motor_gain", self.saved["right_motor_gain"]),
+        )
 
 
 def map_range(value, in_min, in_max, out_min, out_max):
@@ -956,6 +1162,7 @@ class CartController:
         self.tow_right_baseline = 0.0
         self.tow_left_force = 0.0
         self.tow_right_force = 0.0
+        self.calibration = CalibrationStore()
         self.motor_test_until = 0
         self.motor_test_left = 0.0
         self.motor_test_right = 0.0
@@ -1433,7 +1640,7 @@ class CartController:
             "left_motor_gain={:.2f} right_motor_gain={:.2f} "
             "left_force_gain={:.2f} right_force_gain={:.2f} "
             "tow_left_comp={} tow_right_comp={} "
-            "led_force_min={} led_force_full={}"
+            "led_force_min={} led_force_full={} cal_loaded={}"
         ).format(
             MAX_PWM,
             MIN_MOVE_PWM,
@@ -1453,6 +1660,7 @@ class CartController:
             TOW_RIGHT_COMP_RAW,
             LED_FORCE_MIN_RAW,
             LED_FORCE_FULL_RAW,
+            "1" if self.calibration.loaded else "0",
         )
 
     def info_line(self):
@@ -1531,21 +1739,28 @@ class CommandInterface:
             return
         # USB is a developer diagnostic channel, never a second drive source.
         allowed = line.strip().lower() in (
-            "info", "ver", "status", "time status", "hwlog status", "hwlog dump")
+            "info", "ver", "status", "param", "time status", "hwlog status", "hwlog dump", "cal status")
         if not allowed:
             usb.write("err usb_read_only")
             return
         try:
             if self.handle_diagnostic(parts, usb.write, "usb"):
                 return
-            usb.write(self.controller.status_line() if parts[0] == "status"
-                      else self.controller.info_line())
+            command = parts[0].lower()
+            if command == "status":
+                usb.write(self.controller.status_line())
+            elif command == "param":
+                usb.write(self.controller.param_line())
+            elif command == "cal":
+                usb.write(self.controller.calibration.status_line())
+            else:
+                usb.write(self.controller.info_line())
         except Exception as err:
             usb.write("err {}".format(err))
 
     def help(self):
         self.reply(
-            "help cmd: ver info pins status param time sync MS|status stream on|off hwlog dump|clear [SEQ]|status identify [S] tow auto manual idle stop softstop keepalive tare drive L R f [P] b [P] l [P] r [P] motor SIDE DIR [P] [MS] set NAME VALUE"
+            "help cmd: ver info pins status param cal status|save [motor|force] time sync MS|status stream on|off hwlog dump|clear [SEQ]|status identify [S] tow auto manual idle stop softstop keepalive tare drive L R f [P] b [P] l [P] r [P] motor SIDE DIR [P] [MS] set NAME VALUE"
         )
         self.reply(
             "help set: max_pwm min_pwm start_raw full_raw steer_gain ramp decel_ramp manual_max timeout_ms reverse_neutral_ms left_motor_gain right_motor_gain left_force_gain right_force_gain tow_left_comp tow_right_comp"
@@ -1618,11 +1833,8 @@ class CommandInterface:
         )
 
     def handle_set(self, parts):
-        global MAX_PWM, MIN_MOVE_PWM, PULL_START_RAW, PULL_FULL_RAW
-        global STEER_GAIN, RAMP_STEP, DECEL_RAMP_STEP, MANUAL_MAX_PWM
-        global MANUAL_TIMEOUT_MS, REVERSE_NEUTRAL_MS
-        global LEFT_MOTOR_GAIN, RIGHT_MOTOR_GAIN, LEFT_FORCE_GAIN, RIGHT_FORCE_GAIN
-        global TOW_LEFT_COMP_RAW, TOW_RIGHT_COMP_RAW
+        global MAX_PWM, MIN_MOVE_PWM, STEER_GAIN, RAMP_STEP, DECEL_RAMP_STEP
+        global MANUAL_MAX_PWM, MANUAL_TIMEOUT_MS, REVERSE_NEUTRAL_MS
 
         if len(parts) != 3:
             self.reply("err usage: set NAME VALUE")
@@ -1636,18 +1848,22 @@ class CommandInterface:
             return
 
         stored = value
-        if name == "max_pwm":
+        if name in CALIBRATION_FIELDS:
+            try:
+                applied = apply_calibration_values({name: value}, source="runtime")
+            except ValueError as err:
+                self.reply("err {}".format(err))
+                return
+            stored = applied[name]
+            self.controller.hardware_log.event(
+                "cal_set", "name={} value={}".format(name, format_calibration_value(name, stored))
+            )
+        elif name == "max_pwm":
             MAX_PWM = clamp(value, 0.05, 0.80)
             stored = MAX_PWM
         elif name == "min_pwm":
             MIN_MOVE_PWM = clamp(value, 0.0, MAX_PWM)
             stored = MIN_MOVE_PWM
-        elif name == "start_raw":
-            PULL_START_RAW = int(max(0, value))
-            stored = PULL_START_RAW
-        elif name == "full_raw":
-            PULL_FULL_RAW = int(max(PULL_START_RAW + 1, value))
-            stored = PULL_FULL_RAW
         elif name == "steer_gain":
             STEER_GAIN = clamp(value, 0.0, 2.0)
             stored = STEER_GAIN
@@ -1666,30 +1882,54 @@ class CommandInterface:
         elif name == "reverse_neutral_ms":
             REVERSE_NEUTRAL_MS = int(clamp(value, 50, 1000))
             stored = REVERSE_NEUTRAL_MS
-        elif name == "left_motor_gain":
-            LEFT_MOTOR_GAIN = clamp(value, 0.50, 1.20)
-            stored = LEFT_MOTOR_GAIN
-        elif name == "right_motor_gain":
-            RIGHT_MOTOR_GAIN = clamp(value, 0.50, 1.20)
-            stored = RIGHT_MOTOR_GAIN
-        elif name == "left_force_gain":
-            LEFT_FORCE_GAIN = clamp(value, 0.20, 3.00)
-            stored = LEFT_FORCE_GAIN
-        elif name == "right_force_gain":
-            RIGHT_FORCE_GAIN = clamp(value, 0.20, 3.00)
-            stored = RIGHT_FORCE_GAIN
-        elif name == "tow_left_comp":
-            TOW_LEFT_COMP_RAW = int(clamp(value, 0, MAX_SAFE_RAW))
-            stored = TOW_LEFT_COMP_RAW
-        elif name == "tow_right_comp":
-            TOW_RIGHT_COMP_RAW = int(clamp(value, 0, MAX_SAFE_RAW))
-            stored = TOW_RIGHT_COMP_RAW
         else:
             self.reply("err unknown_set_name")
             return
 
-        self.reply("ok set {}={}".format(name, stored))
+        self.reply("ok set {}={}".format(name, format_calibration_value(name, stored) if name in CALIBRATION_FIELDS else stored))
         self.reply(self.controller.param_line())
+        if name in CALIBRATION_FIELDS:
+            self.reply(self.controller.calibration.status_line())
+
+    def handle_cal(self, parts):
+        store = self.controller.calibration
+        action = parts[1].lower() if len(parts) >= 2 else "status"
+        if action == "status" and len(parts) <= 2:
+            self.reply(store.status_line())
+            self.reply(self.controller.param_line())
+            return
+        if action == "save":
+            group = parts[2].lower() if len(parts) == 3 else "all"
+            if group not in ("all", "motor", "force"):
+                self.reply("err cal_usage")
+                return
+            self.controller.stop(MODE_IDLE, "cal_save")
+            if not self.controller.motors_stopped():
+                self.reply("err cal_not_idle")
+                return
+            names = CALIBRATION_FIELDS if group == "all" else CALIBRATION_GROUPS[group]
+            current = current_calibration_values()
+            values = dict(store.saved)
+            for name in names:
+                values[name] = current[name]
+            try:
+                saved = store.save(values)
+            except OSError as err:
+                self.controller.hardware_log.event("cal_save_error", "group={} err={}".format(group, err))
+                self.reply("err cal_save {}".format(err))
+                return
+            self.controller.hardware_log.event("cal_save", "group={}".format(group))
+            self.reply(
+                "ok cal_save group={} left_motor_gain={} right_motor_gain={}".format(
+                    group,
+                    format_calibration_value("left_motor_gain", saved["left_motor_gain"]),
+                    format_calibration_value("right_motor_gain", saved["right_motor_gain"]),
+                )
+            )
+            self.reply(store.status_line())
+            self.reply(self.controller.param_line())
+            return
+        self.reply("err cal_usage")
 
     def drive_shortcut(self, command, parts):
         power = 0.16
@@ -1725,7 +1965,7 @@ class CommandInterface:
 
         command = parts[0].lower()
         now = ticks_ms()
-        if command not in ("keepalive", "status", "hwlog", "diag", "time") and (
+        if command not in ("keepalive", "status", "hwlog", "diag", "time", "cal", "param") and (
                 command != self.last_command or ticks_diff(now, self.last_command_ms) >= 500):
             self.controller.hardware_log.event("command", "name={}".format(command))
             self.last_command = command
@@ -1746,6 +1986,8 @@ class CommandInterface:
                 self.reply(self.controller.status_line())
             elif command == "param" or command == "params":
                 self.reply(self.controller.param_line())
+            elif command == "cal":
+                self.handle_cal(parts)
             elif command == "identify" or command == "id" or command == "led":
                 seconds = 5.0
                 if len(parts) > 1:
@@ -1917,6 +2159,25 @@ def main():
     front_obstacle.attach_stop_callback(controller.front_obstacle_stop)
     led_mode.set_controller(controller)
     commands = CommandInterface(controller, ble, led_mode)
+    loaded = controller.calibration.load()
+    if loaded is None:
+        apply_calibration_values(default_calibration_values(), source="runtime")
+        hardware_log.event(
+            "cal_default",
+            "reason={}".format(controller.calibration.last_error or "missing"),
+        )
+        print("cal_default reason={}".format(controller.calibration.last_error or "missing"))
+    else:
+        try:
+            apply_calibration_values(loaded, source="file")
+            hardware_log.event("cal_load", "source=file")
+            print("cal_load source=file")
+        except ValueError as err:
+            apply_calibration_values(default_calibration_values(), source="runtime")
+            controller.calibration.loaded = False
+            controller.calibration.last_error = str(err)
+            hardware_log.event("cal_default", "reason={}".format(err))
+            print("cal_default reason={}".format(err))
 
     print("Keep both load cells unloaded. Taring...")
     led_mode.pulse(2000)

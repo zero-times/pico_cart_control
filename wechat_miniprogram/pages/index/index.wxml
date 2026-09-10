@@ -141,6 +141,21 @@
 
   <view wx:if="{{connected}}" class="section">
     <view class="section-head">
+      <text>轮速校准</text>
+      <button class="mini-button" bindtap="refreshCalibration">刷新</button>
+    </view>
+    <view class="muted diagnostic-note">当前增益 左 {{paramInputs.left_motor_gain}} / 右 {{paramInputs.right_motor_gain}}。已保存 左 {{savedLeftGain}} / 右 {{savedRightGain}}。</view>
+    <view class="diagnostic-note">{{calStatus}}</view>
+    <view class="log-actions">
+      <button class="mini-button" bindtap="testLeftWheel">试左轮</button>
+      <button class="mini-button" bindtap="testRightWheel">试右轮</button>
+      <button class="mini-button" bindtap="testStraight">短距直行</button>
+      <button class="mini-button primary" bindtap="saveMotorCalibration" loading="{{calSaving}}" disabled="{{calSaving}}">停车并保存</button>
+    </view>
+  </view>
+
+  <view wx:if="{{connected}}" class="section">
+    <view class="section-head">
       <text>参数</text>
       <button class="mini-button" bindtap="sendParamQuery">刷新</button>
     </view>

@@ -168,7 +168,11 @@ Page({
     },
     params: {},
     paramInputs: Object.assign({}, DEFAULT_PARAM_INPUTS),
-    paramRows: buildParamRows(DEFAULT_PARAM_INPUTS)
+    paramRows: buildParamRows(DEFAULT_PARAM_INPUTS),
+    calStatus: '未读取',
+    calSaving: false,
+    savedLeftGain: '-',
+    savedRightGain: '-'
   },
 
   writeBusy: false,
@@ -531,6 +535,8 @@ Page({
       assertCurrent()
       await this.sendCommand('param')
       assertCurrent()
+      await this.sendCommand('cal status')
+      assertCurrent()
       this.startDiagnosticsPolling()
       return true
     } catch (err) {
@@ -651,6 +657,22 @@ Page({
         paramInputs: inputs,
         paramRows: buildParamRows(inputs)
       })
+    } else if (parsed.type === 'cal') {
+      this.setData({
+        calSaving: false,
+        calStatus: parsed.err && parsed.err !== '-' ? `校准文件不可用：${parsed.err}` : `已保存=${parsed.loaded === '1' ? '是' : '否'}，未保存改动=${parsed.dirty === '1' ? '有' : '无'}`,
+        savedLeftGain: parsed.saved_left_motor_gain || this.data.savedLeftGain,
+        savedRightGain: parsed.saved_right_motor_gain || this.data.savedRightGain
+      })
+    } else if (parsed.type === 'ok' && /^ok cal_save(?:\s|$)/.test(line)) {
+      this.setData({
+        calSaving: false,
+        calStatus: `已保存左右轮增益 ${parsed.left_motor_gain || '-'} / ${parsed.right_motor_gain || '-'}`,
+        savedLeftGain: parsed.left_motor_gain || this.data.savedLeftGain,
+        savedRightGain: parsed.right_motor_gain || this.data.savedRightGain
+      })
+    } else if (parsed.type === 'err' && /^err cal/.test(line)) {
+      this.setData({ calSaving: false, calStatus: `保存失败：${line}` })
     } else if (parsed.type === 'info') {
       this.setData({ info: parsed, firmware: parsed.fw || this.data.firmware })
     } else if (parsed.type === 'ok' && parsed.stream) {
@@ -1086,6 +1108,29 @@ Page({
       return
     }
     this.sendCommand(`set ${key} ${value}`)
+  },
+
+  refreshCalibration() {
+    this.sendCommand('cal status')
+  },
+
+  testLeftWheel() {
+    this.sendCommand('motor left f 0.16 800')
+  },
+
+  testRightWheel() {
+    this.sendCommand('motor right f 0.16 800')
+  },
+
+  testStraight() {
+    this.sendCommand('f 0.16')
+  },
+
+  saveMotorCalibration() {
+    if (this.data.calSaving) return
+    this.setData({ calSaving: true, calStatus: '正在停车并保存轮速增益' })
+    this.sendCommand('stop')
+    this.sendCommand('cal save motor')
   },
 
   onCustomInput(event) {

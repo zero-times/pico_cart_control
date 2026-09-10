@@ -69,6 +69,8 @@ object PicoProtocol {
         "reverse_neutral_ms" -> "反向零位等待（毫秒）"
         "tow_left_comp" -> "牵引左通道补偿（原始拉力）"
         "tow_right_comp" -> "牵引右通道补偿（原始拉力）"
+        "left_motor_gain" -> "左轮增益"
+        "right_motor_gain" -> "右轮增益"
         else -> key
     }
 
