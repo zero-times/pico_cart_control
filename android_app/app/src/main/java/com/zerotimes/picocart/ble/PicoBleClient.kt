@@ -70,8 +70,9 @@ class PicoBleClient(
     private var writeCharacteristic: BluetoothGattCharacteristic? = null
     private var notifyCharacteristic: BluetoothGattCharacteristic? = null
     private var writeNoResponse = false
-    private var rxBuffer = ""
+    private val lineAssembler = BleLineAssembler()
     private var discoveryStarted = false
+    private var pendingChannel: BleChannel? = null
     @Volatile private var pendingWriteAck: CompletableDeferred<Int>? = null
 
     init {
@@ -178,7 +179,8 @@ class PicoBleClient(
         writeCharacteristic = null
         notifyCharacteristic = null
         writeNoResponse = false
-        rxBuffer = ""
+        lineAssembler.reset()
+        pendingChannel = null
         discoveryStarted = false
     }
 
@@ -260,6 +262,7 @@ class PicoBleClient(
         }
         val bytes = "${command.text}\n".toByteArray(Charsets.UTF_8)
         for (offset in bytes.indices step WRITE_CHUNK_BYTES) {
+            if (currentGatt !== gatt) return
             val end = minOf(offset + WRITE_CHUNK_BYTES, bytes.size)
             val payload = bytes.copyOfRange(offset, end)
             if (!writeChunk(currentGatt, characteristic, payload)) {
@@ -281,6 +284,7 @@ class PicoBleClient(
         }
 
         repeat(WRITE_ATTEMPTS) { attempt ->
+            if (currentGatt !== gatt) return false
             if (writeNoResponse) {
                 if (startGattWrite(currentGatt, characteristic, payload, writeType)) {
                     delay(NO_RESPONSE_WRITE_GAP_MS)
@@ -360,10 +364,12 @@ class PicoBleClient(
             characteristic: BluetoothGattCharacteristic,
             status: Int,
         ) {
+            if (gatt !== this@PicoBleClient.gatt) return
             pendingWriteAck?.complete(status)
         }
 
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            if (gatt !== this@PicoBleClient.gatt) return
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 onEvent(BleEvent.Error("connection status=$status"))
                 close()
@@ -386,11 +392,13 @@ class PicoBleClient(
         }
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            if (gatt !== this@PicoBleClient.gatt) return
             onEvent(BleEvent.Log("mtu $mtu status=$status"))
             discoverServices(gatt)
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+            if (gatt !== this@PicoBleClient.gatt) return
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 onEvent(BleEvent.Error("service discovery status=$status"))
                 return
@@ -404,11 +412,23 @@ class PicoBleClient(
             writeCharacteristic = selection.writeChar
             notifyCharacteristic = selection.notifyChar
             writeNoResponse = selection.channel.writeNoResponse
-            if (enableNotifications(gatt, selection.notifyChar)) {
-                connectedDevice?.let { onEvent(BleEvent.Connected(it, selection.channel)) }
-                onEvent(BleEvent.Log("channel ${selection.channel.serviceId} ${selection.channel.writeCharId}"))
-            } else {
+            pendingChannel = selection.channel
+            if (!enableNotifications(gatt, selection.notifyChar)) {
+                pendingChannel = null
                 onEvent(BleEvent.Error("notify setup failed"))
+                gatt.disconnect()
+            } else if (selection.notifyChar.getDescriptor(CLIENT_CONFIG_UUID) == null) {
+                notificationsReady()
+            }
+        }
+
+        override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+            if (gatt !== this@PicoBleClient.gatt || descriptor.uuid != CLIENT_CONFIG_UUID) return
+            if (status == BluetoothGatt.GATT_SUCCESS) notificationsReady()
+            else {
+                pendingChannel = null
+                onEvent(BleEvent.Error("notify setup status=$status"))
+                gatt.disconnect()
             }
         }
 
@@ -416,6 +436,7 @@ class PicoBleClient(
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic,
         ) {
+            if (gatt !== this@PicoBleClient.gatt) return
             handleNotify(characteristic.value ?: return)
         }
 
@@ -424,8 +445,16 @@ class PicoBleClient(
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray,
         ) {
+            if (gatt !== this@PicoBleClient.gatt) return
             handleNotify(value)
         }
+    }
+
+    private fun notificationsReady() {
+        val channel = pendingChannel ?: return
+        pendingChannel = null
+        connectedDevice?.let { onEvent(BleEvent.Connected(it, channel)) }
+        onEvent(BleEvent.Log("channel ${channel.serviceId} ${channel.writeCharId}"))
     }
 
     private fun discoverServices(gatt: BluetoothGatt) {
@@ -441,6 +470,7 @@ class PicoBleClient(
         characteristic: BluetoothGattCharacteristic,
     ): Boolean {
         val localOk = gatt.setCharacteristicNotification(characteristic, true)
+        if (!localOk) return false
         val descriptor = characteristic.getDescriptor(CLIENT_CONFIG_UUID)
         if (descriptor == null) {
             return localOk
@@ -455,14 +485,10 @@ class PicoBleClient(
     }
 
     private fun handleNotify(bytes: ByteArray) {
-        val chunk = bytes.toString(Charsets.UTF_8)
-        var buffer = (rxBuffer + chunk).replace('\r', '\n')
-        val lines = buffer.split('\n')
-        buffer = lines.lastOrNull().orEmpty()
-        lines.dropLast(1).map { it.trim() }.filter { it.isNotEmpty() }.forEach { line ->
-            onEvent(BleEvent.LineReceived(line))
-        }
-        rxBuffer = if (buffer.length > 240) buffer.takeLast(240) else buffer
+        lineAssembler.accept(bytes,
+            onLine = { onEvent(BleEvent.LineReceived(it)) },
+            onOverflow = { onEvent(BleEvent.Error("BLE 响应行过长，已丢弃；请重新导出日志")) },
+        )
     }
 
     private fun pickUartChannel(services: List<BluetoothGattService>): ChannelSelection? {

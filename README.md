@@ -536,21 +536,25 @@ adb shell tail -n 120 /sdcard/Android/data/com.zerotimes.picocart/files/logs/pic
 
 ### Pico 硬件诊断日志
 
-Pico 会在 RAM 中维护最近 `192` 条硬件诊断记录，不会在行驶过程中写 Flash。
-进入 Android App 的 `调试` 页，连接并收到 Pico 心跳后，点击 `导出硬件日志`；App 会发送
-`hwlog dump`，Pico 通过 BLE UART 逐条回传，Android 会以 `[hardware]` 分类追加到同一份
-`pico_cart_debug.log` 中。导出进度只显示在界面，不会把整批记录刷进命令日志。
+Pico 固件 `0.2.0` 在 RAM 中保留最近 `192` 条诊断记录；满后覆盖最旧记录，断电后丢失，
+行驶中不为日志写 Flash。每条记录带固件版本、全局序号、单调启动时长和校时状态对应的时间。
+记录覆盖连接、命令、传感器异常、停车原因与运行快照。
 
-Pico 端也支持直接发送：
+Android 建立 BLE 通道后先同步手机时间，再查询日志容量。界面显示时间同步状态，支持主动
+同步；容量达到 `90%` 时提示主动同步日志。日志不会实时导入手机：用户发起导出后，App 校验
+序号和结束标记，将完整结果保存到现有日志文件，再询问是否清理已导出的 Pico 记录。
+清理已导出记录会保留导出开始后新产生的记录；主动清空缓存也需要用户确认。
 
-```text
-hwlog status    # 查看缓存条数和导出状态
-hwlog dump      # 开始 BLE 分批回传
-hwlog clear     # 清空 RAM 环形缓存
-```
+USB CDC 是独立的开发者调试通道，不占用 BLE 的 UART0（GP0/GP1）。在 `main.py` 正常
+运行时，USB 支持 `time status`、`info`、`status`、`hwlog status`、`hwlog dump` 只读指令，
+并限流输出 `usb_log ...` 事件，无需按 Ctrl-C；USB 不提供行驶命令、校时或清理操作。
+MicroPython REPL 和刷写能力保留。
 
-记录包含蓝牙连接/断开、命令、手动保活超时、HX711 左右读取异常与恢复、急停/障碍/传感器
-安全停车、模式切换、软停止和每 250ms 的运行快照。发生“突然停止”后，可同时拉取 App 日志：
+未同步时间的记录为 `u=0`；校时只给后续日志增加 Unix 时间，不改变电机控制时钟。早期记录
+可借助 `time_sync` 事件和启动时长人工关联，不能视作已精确校时的记录。
+
+连接中断或导出超时、缺号时，App 提示日志可能不完整，不应确认清理。完整采集步骤、线协议
+和硬件验收清单见 [Pico 诊断日志指南](docs/PICO_DIAGNOSTIC_LOGS_GUIDE.md)。Android 日志可取出：
 
 ```bash
 adb pull /sdcard/Android/data/com.zerotimes.picocart/files/logs/pico_cart_debug.log .

@@ -380,3 +380,45 @@ button {
   line-height: 1.55;
   word-break: break-all;
 }
+
+.diagnostic-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12rpx;
+  margin: 16rpx 0;
+  font-size: 25rpx;
+}
+
+.diagnostic-label {
+  color: #4f5f70;
+  margin-right: 14rpx;
+}
+
+.sync-state {
+  font-weight: 600;
+}
+
+.diagnostic-button {
+  padding: 0 16rpx;
+  flex-shrink: 0;
+}
+
+.diagnostic-note {
+  font-size: 23rpx;
+  line-height: 1.6;
+  margin: 10rpx 0 18rpx;
+}
+
+.text-warning {
+  color: #a63c2d;
+}
+
+.diagnostic-file {
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+.diagnostic-save {
+  width: 100%;
+}

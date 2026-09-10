@@ -21,6 +21,7 @@ import com.zerotimes.picocart.ble.BleEvent
 import com.zerotimes.picocart.ble.PicoBleClient
 import com.zerotimes.picocart.gamepad.GamepadState
 import com.zerotimes.picocart.logging.PersistentDebugLogStore
+import com.zerotimes.picocart.logging.HardwareLogExport
 import com.zerotimes.picocart.protocol.PicoProtocol
 import com.zerotimes.picocart.speech.MamboVoiceState
 import kotlinx.coroutines.Job
@@ -84,6 +85,16 @@ data class CartUiState(
     val mamboOverlayStatus: String = "",
     val mamboSpeechText: String = "",
     val mamboSpeechId: Long = 0L,
+    val firmwareVersion: String = "未知",
+    val clockSyncStatus: String = "未同步",
+    val clockSyncing: Boolean = false,
+    val hardwareLogUsed: Int? = null,
+    val hardwareLogCapacity: Int? = null,
+    val hardwareLogUsedPercent: Int? = null,
+    val hardwareLogOverwritten: Long = 0,
+    val hardwareLogClearPrompt: String? = null,
+    val hardwareLogClearBusy: Boolean = false,
+    val hardwareLogSavedPath: String = "",
     val hardwareLogExporting: Boolean = false,
     val hardwareLogReceived: Int = 0,
     val hardwareLogTotal: Int = 0,
@@ -136,6 +147,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _uiState = MutableStateFlow(
         CartUiState(
             agentApiKey = prefs.getString(PREF_DEEPSEEK_API_KEY, "").orEmpty(),
+            hardwareLogSavedPath = prefs.getString("hardware_log_path", "").orEmpty().takeIf { File(it).isFile }.orEmpty(),
             agentMessages = listOf(
                 AgentChatEntry(
                     id = "agent-welcome",
@@ -147,7 +159,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     )
     val uiState: StateFlow<CartUiState> = _uiState.asStateFlow()
 
-    private val client = PicoBleClient(application, viewModelScope, ::handleBleEvent)
+    private val client = PicoBleClient(application, viewModelScope) { event ->
+        viewModelScope.launch { handleBleEvent(event) }
+    }
     private val agentRuntime = AgentRuntime(
         store = sessionStore,
         hardware = object : CartHardware {
@@ -196,6 +210,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var driveJob: Job? = null
     private var heartbeatJob: Job? = null
     private var hardwareLogExportTimeoutJob: Job? = null
+    private var connectionInitJob: Job? = null
+    private var diagnosticsPollJob: Job? = null
+    private var clockSyncTimeoutJob: Job? = null
+    private var hardwareLogClearTimeoutJob: Job? = null
+    private var connectionGeneration = 0L
+    private var pendingClockUnixMs: Long? = null
+    private var hardwareExport: HardwareLogExport? = null
+    private val retiredExportIds = mutableSetOf<Long>()
+    private var hardwareExportLastActivity = 0L
+    private var clearSnapshotSequence: Long? = null
     private var mamboOverlayHideJob: Job? = null
     private var lastLogFile: File? = null
     private var identifyAfterConnected = false
@@ -248,6 +272,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun disconnect() {
+        cancelConnectionDiagnostics()
         releaseDrive(sendStop = false)
         heartbeatJob?.cancel()
         lastHeartbeatElapsedMs = 0L
@@ -279,30 +304,83 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun sendTare() = sendCommand("tare")
     fun sendIdentify() = sendCommand("identify 5")
 
-    fun exportHardwareLog() {
-        if (!sendCommand("hwlog dump")) return
-        hardwareLogExportTimeoutJob?.cancel()
-        _uiState.update {
-            it.copy(
-                hardwareLogExporting = true,
-                hardwareLogReceived = 0,
-                hardwareLogTotal = 0,
-                hardwareLogStatus = "正在请求 Pico 硬件日志",
-            )
+    fun syncDeviceClock() {
+        if (!_uiState.value.connected || _uiState.value.clockSyncing) return
+        clockSyncTimeoutJob?.cancel()
+        pendingClockUnixMs = System.currentTimeMillis()
+        _uiState.update { it.copy(clockSyncing = true, clockSyncStatus = "同步中") }
+        // Queued before any initialization heartbeat; a failed sync never gates controls.
+        client.sendCommand("time sync $pendingClockUnixMs")
+        clockSyncTimeoutJob = viewModelScope.launch {
+            delay(8_000)
+            pendingClockUnixMs = null
+            _uiState.update { it.copy(clockSyncing = false, clockSyncStatus = "同步失败，请重试") }
         }
-        addLog("hardware log export requested")
+    }
+
+    fun requestHardwareLogClear() {
+        if (!_uiState.value.connected || _uiState.value.hardwareLogExporting || _uiState.value.hardwareLogClearBusy) return
+        clearSnapshotSequence = null
+        _uiState.update { it.copy(hardwareLogClearPrompt = "清空 Pico 当前全部日志？未保存的日志将无法恢复。") }
+    }
+
+    fun dismissHardwareLogClear() {
+        clearSnapshotSequence = null
+        _uiState.update { it.copy(hardwareLogClearPrompt = null) }
+    }
+
+    fun confirmHardwareLogClear() {
+        if (_uiState.value.hardwareLogClearPrompt == null || _uiState.value.hardwareLogExporting) return
+        val sequence = clearSnapshotSequence
+        dismissHardwareLogClear()
+        if (!sendCommand("hwlog clear" + (sequence?.let { " $it" } ?: ""), hardwareClearConfirmed = true)) return
+        _uiState.update { it.copy(hardwareLogClearBusy = true, hardwareLogStatus = "正在清理 Pico 日志") }
+        hardwareLogClearTimeoutJob?.cancel()
+        hardwareLogClearTimeoutJob = viewModelScope.launch {
+            delay(8_000)
+            _uiState.update { it.copy(hardwareLogClearBusy = false, hardwareLogStatus = "清理响应超时，请刷新状态确认") }
+            if (_uiState.value.connected) client.sendCommand("hwlog status")
+        }
+    }
+
+    fun exportHardwareLog() {
+        if (_uiState.value.hardwareLogExporting || _uiState.value.hardwareLogClearBusy) return
+        if (!sendCommand("hwlog dump")) return
+        dismissHardwareLogClear()
+        val snapshot = HardwareLogExport(retiredExportIds.toSet())
+        hardwareExport = snapshot
+        hardwareExportLastActivity = SystemClock.elapsedRealtime()
+        val startedAt = hardwareExportLastActivity
+        _uiState.update {
+            it.copy(hardwareLogExporting = true, hardwareLogReceived = 0, hardwareLogTotal = 0,
+                hardwareLogStatus = "正在请求 Pico 硬件日志")
+        }
+        hardwareLogExportTimeoutJob?.cancel()
         hardwareLogExportTimeoutJob = viewModelScope.launch {
-            delay(HARDWARE_LOG_EXPORT_TIMEOUT_MS)
-            if (_uiState.value.hardwareLogExporting) {
-                _uiState.update {
-                    it.copy(
-                        hardwareLogExporting = false,
-                        hardwareLogStatus = "导出超时，日志可能不完整",
-                    )
+            while (isActive && hardwareExport === snapshot && !snapshot.finished) {
+                delay(1_000)
+                val now = SystemClock.elapsedRealtime()
+                if (now - hardwareExportLastActivity > 15_000 || now - startedAt > 120_000) {
+                    failHardwareExport("导出超时，日志不完整，请重试")
+                    break
                 }
-                addLog("hardware log export timeout")
             }
         }
+    }
+
+    private fun cancelConnectionDiagnostics() {
+        connectionGeneration++
+        connectionInitJob?.cancel()
+        diagnosticsPollJob?.cancel()
+        clockSyncTimeoutJob?.cancel()
+        hardwareLogClearTimeoutJob?.cancel()
+        pendingClockUnixMs = null
+        failHardwareExport("Pico 已断开，导出中断")
+        retiredExportIds.clear()
+        clearSnapshotSequence = null
+        _uiState.update { it.copy(clockSyncing = false, clockSyncStatus = "未同步", hardwareLogClearPrompt = null,
+            hardwareLogClearBusy = false, hardwareLogExporting = false, hardwareLogUsed = null, hardwareLogCapacity = null,
+            hardwareLogUsedPercent = null, hardwareLogOverwritten = 0, firmwareVersion = "未知") }
     }
 
     fun toggleStream() {
@@ -355,12 +433,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun sendCustom() {
         val command = _uiState.value.customCommand.trim()
-        if (command.isNotEmpty()) {
-            sendCommand(command)
+        when {
+            command.startsWith("hwlog clear") -> requestHardwareLogClear()
+            command == "hwlog dump" -> exportHardwareLog()
+            command.startsWith("time sync") -> syncDeviceClock()
+            command.isNotEmpty() -> sendCommand(command)
         }
     }
 
-    fun sendCommand(command: String, logCommand: Boolean = true): Boolean {
+    fun sendCommand(command: String, logCommand: Boolean = true, hardwareClearConfirmed: Boolean = false): Boolean {
+        if (!hardwareClearConfirmed && Regex("(?im)^\\s*hwlog\\s+clear\\b").containsMatchIn(command)) {
+            requestHardwareLogClear()
+            return false
+        }
         val error = cartConnectionError()
         if (error != null) {
             lastHardwareOperationError = error
@@ -631,12 +716,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun shareHardwareLog(context: Context): Intent? {
+        val file = _uiState.value.hardwareLogSavedPath.takeIf { it.isNotBlank() }?.let(::File) ?: return null
+        if (!file.isFile) {
+            _uiState.update { it.copy(hardwareLogStatus = "已保存的硬件日志文件不存在，请重新导出") }
+            return null
+        }
+        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+        return Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+    }
+
     fun statusSpeechText(): String {
         val status = _uiState.value.status
         return "当前模式 ${status["mode"].orEmpty()}，传感器 ${status["sensor"].orEmpty()}，总拉力 ${status["total"].orEmpty()}，左 PWM ${status["pwml"].orEmpty()}，右 PWM ${status["pwmr"].orEmpty()}。"
     }
 
     override fun onCleared() {
+        cancelConnectionDiagnostics()
         releaseDrive(sendStop = false)
         heartbeatJob?.cancel()
         hardwareLogExportTimeoutJob?.cancel()
@@ -659,6 +759,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             is BleEvent.ScanState -> _uiState.update { it.copy(scanning = event.scanning) }
             is BleEvent.Connected -> handleConnected(event.device, event.channel)
             BleEvent.Disconnected -> {
+                cancelConnectionDiagnostics()
                 releaseDrive(sendStop = false)
                 heartbeatJob?.cancel()
                 hardwareLogExportTimeoutJob?.cancel()
@@ -690,6 +791,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun handleConnected(device: BleDeviceItem, channel: BleChannel) {
+        cancelConnectionDiagnostics()
         _uiState.update {
             it.copy(
                 connected = true,
@@ -706,30 +808,67 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         lastHeartbeatElapsedMs = 0L
         heartbeatMonitorStartedElapsedMs = SystemClock.elapsedRealtime()
+        syncDeviceClock()
         startHeartbeatMonitor()
-        viewModelScope.launch {
+        val generation = connectionGeneration
+        connectionInitJob = viewModelScope.launch {
             delay(180)
+            if (generation != connectionGeneration || !_uiState.value.connected) return@launch
+            client.sendCommand("info")
+            client.sendCommand("hwlog status")
             requestHeartbeat()
             delay(120)
             client.sendCommand("param")
             if (identifyAfterConnected) {
                 delay(200)
                 identifyAfterConnected = false
-                sendCommand("identify 5")
+                if (generation == connectionGeneration) sendCommand("identify 5")
+            }
+        }
+        diagnosticsPollJob = viewModelScope.launch {
+            while (isActive && generation == connectionGeneration && _uiState.value.connected) {
+                delay(30_000)
+                if (!_uiState.value.hardwareLogExporting) client.sendCommand("hwlog status", logCommand = false)
             }
         }
     }
 
     private fun applyLine(line: String) {
         val parsed = PicoProtocol.parseLine(line)
-        if (parsed.type == "hwlog") {
-            handleHardwareLogLine(parsed, line)
+        if (parsed.type == "hwlog" || parsed.type == "hwlog_end" || line.startsWith("ok hwlog_export ")) {
+            handleHardwareExportLine(line)
             return
         }
-        if (parsed.type == "hwlog_end") {
-            finishHardwareLogExport(parsed["n"]?.toIntOrNull())
-            persistentLogs.appendHardware(line)
-            return
+        parsed["fw"]?.let { version -> _uiState.update { it.copy(firmwareVersion = version) } }
+        if (parsed.type == "time") {
+            val requested = pendingClockUnixMs
+            val acknowledged = parsed["unix_ms"]?.toLongOrNull()
+            if (requested != null && parsed["request_ms"]?.toLongOrNull() == requested && parsed["synced"] == "1" && acknowledged != null &&
+                acknowledged in requested..(requested + 15_000)) {
+                clockSyncTimeoutJob?.cancel()
+                pendingClockUnixMs = null
+                _uiState.update { it.copy(clockSyncing = false, clockSyncStatus = "同步成功") }
+            } else if (parsed["synced"] == "0") {
+                clockSyncTimeoutJob?.cancel()
+                pendingClockUnixMs = null
+                _uiState.update { it.copy(clockSyncing = false, clockSyncStatus = "同步失败，请重试") }
+            }
+        }
+        if (line.startsWith("ok hwlog_status ")) {
+            _uiState.update { it.copy(hardwareLogUsed = parsed["n"]?.toIntOrNull(),
+                hardwareLogCapacity = parsed["cap"]?.toIntOrNull(),
+                hardwareLogUsedPercent = parsed["used_pct"]?.toIntOrNull(),
+                hardwareLogOverwritten = parsed["overwritten"]?.toLongOrNull() ?: 0) }
+        }
+        if (line.startsWith("ok hwlog_clear ")) {
+            hardwareLogClearTimeoutJob?.cancel()
+            _uiState.update { it.copy(hardwareLogClearBusy = false, hardwareLogStatus = "已清理，剩余 ${parsed["n"] ?: "未知"} 条") }
+            client.sendCommand("hwlog status")
+        }
+        if (parsed.type == "err" && line.contains("hwlog")) {
+            if (hardwareExport != null) failHardwareExport("Pico 拒绝导出：$line")
+            hardwareLogClearTimeoutJob?.cancel()
+            _uiState.update { it.copy(hardwareLogClearBusy = false, hardwareLogStatus = "操作失败：$line") }
         }
         if (parsed.type != "stat") {
             addLog("< $line")
@@ -756,49 +895,66 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 parsed["stream"]?.let { stream ->
                     _uiState.update { it.copy(streaming = stream == "on") }
                 }
-                parsed["hwlog_export"]?.toIntOrNull()?.let { total ->
-                    _uiState.update {
-                        it.copy(
-                            hardwareLogExporting = true,
-                            hardwareLogTotal = total,
-                            hardwareLogStatus = "正在导出 0/$total 条",
-                        )
-                    }
-                }
+
             }
         }
     }
 
-    private fun handleHardwareLogLine(parsed: com.zerotimes.picocart.protocol.ParsedLine, line: String) {
-        persistentLogs.appendHardware(line)
-        val received = parsed["i"]?.toIntOrNull() ?: return
-        val total = parsed["n"]?.toIntOrNull()?.coerceAtLeast(0) ?: 0
-        _uiState.update {
-            it.copy(
-                hardwareLogExporting = true,
-                hardwareLogReceived = received,
-                hardwareLogTotal = total,
-                hardwareLogStatus = "正在导出 $received/$total 条",
-            )
-        }
-        if (received == 1 || received % HARDWARE_LOG_PROGRESS_LOG_INTERVAL == 0 || received == total) {
-            addLog("hardware log export $received/$total")
+    private fun handleHardwareExportLine(line: String) {
+        val snapshot = hardwareExport ?: return
+        when (snapshot.accept(line)) {
+            HardwareLogExport.Result.IGNORED -> return
+            HardwareLogExport.Result.PROGRESS -> {
+                hardwareExportLastActivity = SystemClock.elapsedRealtime()
+                _uiState.update { it.copy(hardwareLogReceived = snapshot.received, hardwareLogTotal = snapshot.total,
+                    hardwareLogStatus = "正在导出 ${snapshot.received}/${snapshot.total} 条") }
+            }
+            HardwareLogExport.Result.COMPLETE -> persistHardwareExport(snapshot)
+            HardwareLogExport.Result.FAILED -> persistHardwareExport(snapshot)
         }
     }
 
-    private fun finishHardwareLogExport(totalFromEnd: Int?) {
+    private fun failHardwareExport(reason: String) {
+        val snapshot = hardwareExport ?: return
+        if (snapshot.finished) return
+        snapshot.fail(reason)
+        persistHardwareExport(snapshot)
+    }
+
+    private fun persistHardwareExport(snapshot: HardwareLogExport) {
         hardwareLogExportTimeoutJob?.cancel()
-        _uiState.update { state ->
-            val total = totalFromEnd ?: state.hardwareLogTotal
-            val received = state.hardwareLogReceived.coerceAtMost(total.coerceAtLeast(0))
-            state.copy(
-                hardwareLogExporting = false,
-                hardwareLogReceived = received,
-                hardwareLogTotal = total,
-                hardwareLogStatus = "已导出 $received/$total 条",
-            )
+        hardwareExport = null
+        snapshot.exportId?.let { retiredExportIds += it }
+        val generation = connectionGeneration
+        val device = _uiState.value.deviceId
+        val status = if (snapshot.complete) "完整" else "不完整：${snapshot.error}"
+        _uiState.update { it.copy(hardwareLogStatus = "$status，正在保存", hardwareLogReceived = snapshot.received,
+            hardwareLogTotal = snapshot.total) }
+        viewModelScope.launch {
+            try {
+                val metadata = "Pico 硬件日志\nreceived_at_ms=${System.currentTimeMillis()} device=$device\n" +
+                    "complete=${if (snapshot.complete) 1 else 0} received=${snapshot.received} expected=${snapshot.total} " +
+                    "export_id=${snapshot.exportId} last=${snapshot.lastSequence} result=$status\n" +
+                    "t=Pico启动毫秒 u=Unix毫秒（0表示尚未同步）"
+                val file = persistentLogs.saveHardwareSnapshot(snapshot.rawLines, metadata)
+                lastLogFile = file
+                prefs.edit().putString("hardware_log_path", file.absolutePath).apply()
+                addLog("hardware snapshot saved complete=${snapshot.complete} file=${file.absolutePath}")
+                if (generation == connectionGeneration) {
+                    _uiState.update { it.copy(hardwareLogExporting = false, hardwareLogSavedPath = file.absolutePath,
+                        hardwareLogStatus = "$status，已保存 ${snapshot.received}/${snapshot.total} 条",
+                        hardwareLogClearPrompt = if (snapshot.complete && it.connected) "日志已完整保存到手机，是否清理 Pico 中本次已保存的日志？新增日志会保留。" else null) }
+                    clearSnapshotSequence = snapshot.lastSequence.takeIf { snapshot.complete }
+                    if (_uiState.value.connected) client.sendCommand("hwlog status")
+                }
+            } catch (error: Exception) {
+                addLog("hardware snapshot save failed: ${error.message}")
+                if (generation == connectionGeneration) {
+                    _uiState.update { it.copy(hardwareLogExporting = false, hardwareLogClearPrompt = null,
+                        hardwareLogStatus = "保存失败：${error.message}。Pico 日志已保留，请重试") }
+                }
+            }
         }
-        addLog("hardware log export complete n=${totalFromEnd ?: _uiState.value.hardwareLogTotal}")
     }
 
     private fun addLog(message: String) {
@@ -1021,8 +1177,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         const val HEARTBEAT_TIMEOUT_MS = 4_500L
         const val HEARTBEAT_RESPONSE_TIMEOUT_MS = 900L
         const val MANUAL_KEEPALIVE_INTERVAL_MS = 250L
-        const val HARDWARE_LOG_EXPORT_TIMEOUT_MS = 12_000L
-        const val HARDWARE_LOG_PROGRESS_LOG_INTERVAL = 24
         val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.US)
         val fileTimeFormat = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
         val LOCAL_STOP_COMMANDS = setOf("停车", "急停", "取消")

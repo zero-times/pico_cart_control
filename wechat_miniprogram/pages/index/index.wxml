@@ -33,6 +33,38 @@
     </scroll-view>
   </view>
 
+  <view class="section diagnostics">
+    <view class="section-head">
+      <text>硬件诊断</text>
+      <text class="muted mono">固件 {{firmware}}</text>
+    </view>
+    <view class="diagnostic-row">
+      <view>
+        <text class="diagnostic-label">时间同步</text>
+        <text class="sync-state {{timeSyncState === '失败' ? 'text-warning' : ''}}">{{timeSyncState}}</text>
+      </view>
+      <button class="mini-button diagnostic-button" bindtap="syncTime" disabled="{{!connected || timeSyncState === '同步中'}}">手动同步时间</button>
+    </view>
+    <view class="muted diagnostic-note">{{timeSyncDetail}}</view>
+    <view class="diagnostic-row">
+      <text class="diagnostic-label">RAM 缓存</text>
+      <text class="mono {{hardwareStatus.percent >= 90 ? 'text-warning' : ''}}">{{hardwareStatus ? hardwareStatus.count + ' / ' + hardwareStatus.capacity + ' 条 · ' + hardwareStatus.percent + '%' : '等待查询'}}</text>
+    </view>
+    <progress wx:if="{{hardwareStatus}}" percent="{{hardwareStatus.percent}}" stroke-width="5" activeColor="{{hardwareStatus.percent >= 90 ? '#a63c2d' : '#2f7de1'}}" backgroundColor="#edf1f5" />
+    <view class="diagnostic-note {{hardwareStatus.percent >= 90 ? 'text-warning' : 'muted'}}">{{diagnosticsMessage}}</view>
+    <view wx:if="{{hardwareStatus.overwritten > 0}}" class="diagnostic-note text-warning">本次启动已覆盖 {{hardwareStatus.overwritten}} 条旧日志。</view>
+    <view class="muted diagnostic-note">缓存满后覆盖最旧记录，断电即丢失。手机继续通过 BLE 控制；USB 用于电脑调试和导出。</view>
+    <view class="log-actions">
+      <button class="mini-button primary" bindtap="exportHardwareLogs" loading="{{exportActive}}" disabled="{{!connected || exportActive || clearPending}}">同步日志到手机</button>
+      <button class="mini-button" bindtap="refreshHardwareStatus" disabled="{{!connected || exportActive || clearPending}}">刷新缓存</button>
+      <button class="mini-button" bindtap="shareHardwareLogs" disabled="{{!hardwareFileName}}">发送已存日志</button>
+      <button class="mini-button danger" bindtap="clearHardwareLogs" loading="{{clearPending}}" disabled="{{!connected || exportActive || clearPending}}">清空硬件日志</button>
+    </view>
+    <view class="diagnostic-note">{{exportMessage}}</view>
+    <button wx:if="{{exportCanSave}}" class="mini-button diagnostic-save" bindtap="saveReceivedHardwareLogs">保存已收到的记录</button>
+    <view wx:if="{{hardwareFileName}}" class="muted diagnostic-note diagnostic-file">手机文件：{{hardwareFileName}}</view>
+  </view>
+
   <view wx:if="{{connected}}" class="section">
     <view class="section-head">
       <text>状态</text>

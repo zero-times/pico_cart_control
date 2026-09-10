@@ -1,4 +1,5 @@
 const { parseLine } = require('../../utils/protocol')
+const { createLineReader, createExport, acceptExportLine, finishExport, addError, readHardwareStatus } = require('../../utils/hardware-log')
 
 const SERVICE_HINTS = [
   '6E400001-B5A3-F393-E0A9-E50E24DCCA9E',
@@ -138,6 +139,16 @@ Page({
     logs: [],
     logAnchor: '',
     info: {},
+    firmware: '-',
+    timeSyncState: '未同步',
+    timeSyncDetail: '连接后自动同步手机时间',
+    hardwareStatus: null,
+    diagnosticsMessage: 'RAM 日志未查询',
+    exportActive: false,
+    exportMessage: '按需同步日志到手机',
+    exportCanSave: false,
+    hardwareFileName: '',
+    clearPending: false,
     status: {
       mode: '-',
       sensor: '-',
@@ -159,7 +170,8 @@ Page({
   },
 
   writeBusy: false,
-  pendingCommand: '',
+  commandQueue: null,
+  connectionSession: 0,
   driveTimer: null,
   stopTimer: null,
   lastTouchDriveAt: 0,
@@ -168,14 +180,40 @@ Page({
   lastLogFileName: '',
 
   onLoad() {
-    wx.onBluetoothDeviceFound(this.onBluetoothDeviceFound.bind(this))
-    wx.onBLECharacteristicValueChange(this.onCharacteristicChanged.bind(this))
-    wx.onBluetoothAdapterStateChange(this.onAdapterStateChanged.bind(this))
-    wx.onBLEConnectionStateChange(this.onConnectionStateChanged.bind(this))
+    this.commandQueue = []
+    this.fullLogs = []
+    this.listeners = {
+      BluetoothDeviceFound: this.onBluetoothDeviceFound.bind(this),
+      BLECharacteristicValueChange: this.onCharacteristicChanged.bind(this),
+      BluetoothAdapterStateChange: this.onAdapterStateChanged.bind(this),
+      BLEConnectionStateChange: this.onConnectionStateChanged.bind(this)
+    }
+    Object.keys(this.listeners).forEach((name) => wx[`on${name}`](this.listeners[name]))
+    this.resetLineReader()
+  },
+
+  onShow() {
+    this.pageHidden = false
+    if (this.data.connected) {
+      this.refreshHardwareStatus()
+      this.startDiagnosticsPolling()
+    }
+  },
+
+  onHide() {
+    this.pageHidden = true
+    this.releaseDrive()
+    this.stopDiagnosticsPolling()
+    if (this.hardwareExport) this.endHardwareExport('页面进入后台，导出未完成')
   },
 
   onUnload() {
     this.releaseDrive()
+    this.invalidateConnection('页面已关闭')
+    this.unloaded = true
+    Object.keys(this.listeners || {}).forEach((name) => {
+      if (wx[`off${name}`]) wx[`off${name}`](this.listeners[name])
+    })
     if (this.data.connected && this.data.deviceId) {
       wx.closeBLEConnection({ deviceId: this.data.deviceId })
     }
@@ -248,11 +286,11 @@ Page({
     return `${name}_${formatFileTime(new Date())}.txt`
   },
 
-  writeLogFile() {
+  writeLogFile(options) {
     return new Promise((resolve, reject) => {
-      const fileName = this.buildLogFileName()
+      const fileName = options && options.fileName || this.buildLogFileName()
       const filePath = `${wx.env.USER_DATA_PATH}/${fileName}`
-      const content = this.buildLogText()
+      const content = options && options.content || this.buildLogText()
       wx.getFileSystemManager().writeFile({
         filePath,
         data: content,
@@ -260,6 +298,7 @@ Page({
         success: () => {
           this.lastLogFilePath = filePath
           this.lastLogFileName = fileName
+          this.lastLogFileContent = content
           resolve({ filePath, fileName, content })
         },
         fail: reject
@@ -351,6 +390,7 @@ Page({
         connected: false,
         streaming: false
       })
+      this.invalidateConnection('蓝牙断开，日志未完整接收')
       this.releaseDrive()
       this.addLog('device disconnected')
     }
@@ -400,22 +440,32 @@ Page({
     }
     const ok = await this.connectDevice(device)
     if (ok) {
+      const session = this.connectionSession
       await delay(200)
-      await this.sendCommand('identify 5')
+      if (session === this.connectionSession) await this.sendCommand('identify 5')
     }
   },
 
   async connectDevice(device) {
-    this.setData({ connecting: true })
+    if (this.data.connecting || this.data.connected) return false
+    this.invalidateConnection('重新连接')
+    const session = this.connectionSession
+    const assertCurrent = () => {
+      if (session !== this.connectionSession || this.unloaded) throw new Error('connection canceled')
+    }
+    this.setData({ connecting: true, deviceId: device.deviceId, firmware: '-', hardwareStatus: null,
+      timeSyncState: '未同步', timeSyncDetail: '连接后自动同步手机时间', diagnosticsMessage: 'RAM 日志未查询' })
     this.addLog(`connect ${device.name}`)
     try {
       if (this.data.scanning) {
         await this.stopScan()
+        assertCurrent()
       }
       await wxCall('createBLEConnection', {
         deviceId: device.deviceId,
         timeout: 10000
       })
+      assertCurrent()
 
       if (wx.canIUse && wx.canIUse('setBLEMTU')) {
         try {
@@ -429,13 +479,16 @@ Page({
       }
 
       await delay(400)
+      assertCurrent()
       const channel = await this.pickUartChannel(device.deviceId)
+      assertCurrent()
       await wxCall('notifyBLECharacteristicValueChange', {
         state: true,
         deviceId: device.deviceId,
         serviceId: channel.serviceId,
         characteristicId: channel.notifyCharId
       })
+      assertCurrent()
 
       this.setData({
         connected: true,
@@ -449,11 +502,24 @@ Page({
       })
 
       this.addLog(`channel ${channel.serviceId} ${channel.writeCharId}`)
+      await this.syncTime()
+      assertCurrent()
+      await this.sendCommand('info')
+      assertCurrent()
+      await this.refreshHardwareStatus()
+      assertCurrent()
       await this.sendCommand('status')
+      assertCurrent()
       await this.sendCommand('param')
+      assertCurrent()
+      this.startDiagnosticsPolling()
       return true
     } catch (err) {
+      if (session !== this.connectionSession || this.unloaded) return false
       this.setData({ connecting: false })
+      this.invalidateConnection('连接初始化失败')
+      wx.closeBLEConnection({ deviceId: device.deviceId })
+      this.setData({ connected: false })
       this.addLog(`connect error ${err.errMsg || err}`)
       wx.showToast({
         title: '连接失败',
@@ -465,6 +531,7 @@ Page({
 
   async disconnect() {
     this.releaseDrive()
+    this.invalidateConnection('蓝牙断开，日志未完整接收')
     if (this.data.deviceId) {
       try {
         await wxCall('closeBLEConnection', { deviceId: this.data.deviceId })
@@ -474,6 +541,7 @@ Page({
     }
     this.setData({
       connected: false,
+      connecting: false,
       streaming: false,
       deviceId: '',
       deviceName: '',
@@ -534,30 +602,17 @@ Page({
   },
 
   onCharacteristicChanged(res) {
-    if (res.deviceId !== this.data.deviceId) {
+    if (res.deviceId !== this.data.deviceId || !this.data.connected ||
+        (res.characteristicId && normalizeUuid(res.characteristicId) !== normalizeUuid(this.data.notifyCharId))) {
       return
     }
-    const chunk = ab2str(res.value)
-    let buffer = `${this.data.rxBuffer}${chunk}`.replace(/\r/g, '\n')
-    const lines = buffer.split('\n')
-    buffer = lines.pop() || ''
-
-    lines.forEach((line) => {
-      const trimmed = line.trim()
-      if (trimmed) {
-        this.applyLine(trimmed)
-      }
-    })
-
-    if (buffer.length > 240) {
-      buffer = buffer.slice(-240)
-    }
-    this.setData({ rxBuffer: buffer })
+    this.lineReader.push(ab2str(res.value))
   },
 
   applyLine(line) {
     this.addLog(`< ${line}`)
     const parsed = parseLine(line)
+    this.applyDiagnosticLine(line, parsed)
 
     if (parsed.type === 'stat') {
       this.setData({
@@ -576,24 +631,25 @@ Page({
         paramRows: buildParamRows(inputs)
       })
     } else if (parsed.type === 'info') {
-      this.setData({ info: parsed })
+      this.setData({ info: parsed, firmware: parsed.fw || this.data.firmware })
     } else if (parsed.type === 'ok' && parsed.stream) {
       this.setData({ streaming: parsed.stream === 'on' })
     }
   },
 
-  async writeBytes(bytes) {
+  async writeBytes(bytes, session, channel) {
     const chunkSize = 18
     for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+      if (session !== this.connectionSession || !this.data.connected) throw new Error('connection changed')
       const chunk = bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length))
       const options = {
-        deviceId: this.data.deviceId,
-        serviceId: this.data.serviceId,
-        characteristicId: this.data.writeCharId,
+        deviceId: channel.deviceId,
+        serviceId: channel.serviceId,
+        characteristicId: channel.writeCharId,
         value: bytesToBuffer(chunk)
       }
       if (
-        this.data.writeNoResponse
+        channel.writeNoResponse
         && wx.canIUse
         && wx.canIUse('writeBLECharacteristicValue.object.writeType')
       ) {
@@ -604,36 +660,277 @@ Page({
     }
   },
 
-  async sendCommand(command) {
-    if (!this.data.connected) {
-      this.addLog('not connected')
-      return
-    }
-    if (this.writeBusy) {
-      this.pendingCommand = String(command || '').trim()
-      return
-    }
-    const line = `${String(command || '').trim()}\n`
-    if (line.trim().length === 0) {
-      return
-    }
+  sendCommand(command) {
+    const text = String(command || '').trim()
+    if (!this.data.connected || !text) return Promise.resolve(false)
+    if (!this.commandQueue) this.commandQueue = []
+    return new Promise((resolve) => {
+      // Keep safety stops ahead of queued work, and never replay stale drive repeats.
+      if (text === 'stop' || /^[fblr] /.test(text)) {
+        this.commandQueue = this.commandQueue.filter((entry) => {
+          if (/^[fblr] /.test(entry.command)) { entry.resolve(false); return false }
+          return true
+        })
+      }
+      const entry = { command: text, session: this.connectionSession, resolve }
+      if (text === 'stop') this.commandQueue.unshift(entry)
+      else this.commandQueue.push(entry)
+      this.drainCommands()
+    })
+  },
 
+  async drainCommands() {
+    if (this.writeBusy) return
+    const session = this.connectionSession
     this.writeBusy = true
     try {
-      this.addLog(`> ${line.trim()}`)
-      await this.writeBytes(str2bytes(line))
-    } catch (err) {
-      this.addLog(`write error ${err.errMsg || err}`)
+      while (this.commandQueue.length && session === this.connectionSession) {
+        const entry = this.commandQueue.shift()
+        if (entry.session !== session || !this.data.connected) { entry.resolve(false); continue }
+        try {
+          this.addLog(`> ${entry.command}`)
+          await this.writeBytes(str2bytes(`${entry.command}\n`), session, Object.assign({}, this.data))
+          entry.resolve(session === this.connectionSession)
+        } catch (err) {
+          if (session === this.connectionSession) this.addLog(`write error ${err.errMsg || err}`)
+          entry.resolve(false)
+        }
+      }
     } finally {
-      this.writeBusy = false
-      if (this.pendingCommand) {
-        const pending = this.pendingCommand
-        this.pendingCommand = ''
-        setTimeout(() => {
-          this.sendCommand(pending)
-        }, 0)
+      if (session === this.connectionSession) this.writeBusy = false
+    }
+  },
+
+  resetLineReader() {
+    this.lineReader = createLineReader((line) => this.applyLine(line), () => {
+      this.addLog('receive error: line exceeds 400 characters')
+      if (this.hardwareExport) addError(this.hardwareExport, '收到超长记录，导出不完整')
+    })
+  },
+
+  invalidateConnection(reason) {
+    this.connectionSession += 1
+    this.stopDiagnosticsPolling()
+    clearTimeout(this.timeSyncTimer)
+    clearTimeout(this.hardwareStatusTimer)
+    clearTimeout(this.clearTimer)
+    this.hardwareStatusTimer = null
+    this.timeSyncPending = null
+    this.clearRequest = null
+    ;(this.commandQueue || []).forEach((entry) => entry.resolve(false))
+    this.commandQueue = []
+    this.writeBusy = false
+    this.resetLineReader()
+    if (this.hardwareExport) this.endHardwareExport(reason)
+    this.setData({ clearPending: false, rxBuffer: '', timeSyncState: '未同步', timeSyncDetail: '连接后自动同步手机时间' })
+  },
+
+  async syncTime() {
+    if (!this.data.connected || this.timeSyncPending) return false
+    const pending = { unix: Date.now(), session: this.connectionSession }
+    this.timeSyncPending = pending
+    this.setData({ timeSyncState: '同步中', timeSyncDetail: '正在同步手机时间' })
+    clearTimeout(this.timeSyncTimer)
+    this.timeSyncTimer = setTimeout(() => {
+      if (this.timeSyncPending === pending) {
+        this.timeSyncPending = null
+        this.setData({ timeSyncState: '失败', timeSyncDetail: '未收到时间确认，请手动重试' })
+      }
+    }, 8000)
+    const sent = await this.sendCommand(`time sync ${pending.unix}`)
+    if (!sent && this.timeSyncPending === pending) {
+      clearTimeout(this.timeSyncTimer)
+      this.timeSyncPending = null
+      this.setData({ timeSyncState: '失败', timeSyncDetail: '时间发送失败，请手动重试' })
+    }
+    return sent
+  },
+
+  stopDiagnosticsPolling() {
+    clearInterval(this.diagnosticsTimer)
+    this.diagnosticsTimer = null
+  },
+
+  startDiagnosticsPolling() {
+    this.stopDiagnosticsPolling()
+    if (!this.data.connected || this.pageHidden) return
+    const session = this.connectionSession
+    this.diagnosticsTimer = setInterval(() => {
+      if (session === this.connectionSession && !this.writeBusy && !this.timeSyncPending) this.refreshHardwareStatus()
+    }, 15000)
+  },
+
+  async refreshHardwareStatus() {
+    if (!this.data.connected || this.data.exportActive || this.data.clearPending || this.hardwareStatusTimer) return false
+    const session = this.connectionSession
+    this.hardwareStatusTimer = setTimeout(() => {
+      this.hardwareStatusTimer = null
+      if (session === this.connectionSession) this.setData({ diagnosticsMessage: '缓存状态查询超时，可点刷新重试' })
+    }, 8000)
+    const sent = await this.sendCommand('hwlog status')
+    if (!sent && session === this.connectionSession) {
+      clearTimeout(this.hardwareStatusTimer)
+      this.hardwareStatusTimer = null
+      this.setData({ diagnosticsMessage: '缓存状态查询发送失败' })
+    }
+    return sent
+  },
+
+  applyDiagnosticLine(line, parsed) {
+    if (parsed.type === 'time') {
+      const pending = this.timeSyncPending
+      if (parsed.synced === '1' && /^\d+$/.test(parsed.unix_ms) && /^\d+$/.test(parsed.uptime_ms) &&
+          (!pending || String(pending.unix) === parsed.request_ms)) {
+        clearTimeout(this.timeSyncTimer)
+        this.timeSyncPending = null
+        this.setData({ timeSyncState: '成功', timeSyncDetail: '手机时间已同步；同步前记录仍使用启动时长', firmware: parsed.fw || this.data.firmware })
+      } else if (parsed.synced === '0' && !pending) {
+        this.setData({ timeSyncState: '未同步', timeSyncDetail: '设备时间未同步，请手动同步' })
       }
     }
+    if (/^ok hwlog_status(?:\s|$)/.test(line)) {
+      const status = readHardwareStatus(parsed)
+      if (status) {
+        clearTimeout(this.hardwareStatusTimer)
+        this.hardwareStatusTimer = null
+        this.setData({ hardwareStatus: status, firmware: status.firmware,
+          diagnosticsMessage: status.percent >= 90 ? '缓存已达 90% 以上，请主动同步日志，避免旧记录被覆盖' : '每 15 秒刷新容量；日志仅在点击同步后导入' })
+        if (!status.synced && !this.timeSyncPending) this.setData({ timeSyncState: '未同步', timeSyncDetail: '设备时间未同步，请手动同步' })
+      }
+    }
+    if (/^ok hwlog_clear(?:\s|$)/.test(line) && /^\d+$/.test(parsed.n) && this.clearRequest) {
+      clearTimeout(this.clearTimer)
+      this.clearRequest = null
+      this.setData({ clearPending: false, diagnosticsMessage: `清理已确认，剩余 ${parsed.n} 条，正在刷新` })
+      this.refreshHardwareStatus()
+    }
+    if (parsed.type === 'err' && /^err (hwlog|time)/.test(line)) {
+      if (this.hardwareExport && /^err hwlog/.test(line)) this.endHardwareExport(`设备拒绝导出：${line}`)
+      if (this.clearRequest && /^err hwlog/.test(line)) {
+        clearTimeout(this.clearTimer)
+        this.clearRequest = null
+        this.setData({ clearPending: false, diagnosticsMessage: `清理未成功：${line}` })
+      }
+      if (this.timeSyncPending && /^err time/.test(line)) {
+        clearTimeout(this.timeSyncTimer)
+        this.timeSyncPending = null
+        this.setData({ timeSyncState: '失败', timeSyncDetail: '设备拒绝时间同步，请检查固件版本' })
+      }
+    }
+    if (!this.hardwareExport) return
+    const event = acceptExportLine(this.hardwareExport, line)
+    if (event === 'ignored') return
+    if (event === 'complete' || event === 'incomplete') {
+      this.endHardwareExport()
+    } else {
+      this.setData({ exportMessage: `正在同步 ${this.hardwareExport.records.length} / ${this.hardwareExport.header ? this.hardwareExport.header.count : '?'} 条` })
+      this.armExportIdleTimeout()
+    }
+  },
+
+  armExportIdleTimeout() {
+    clearTimeout(this.exportIdleTimer)
+    this.exportIdleTimer = setTimeout(() => this.endHardwareExport('15 秒未收到日志，导出不完整'), 15000)
+  },
+
+  async exportHardwareLogs() {
+    if (!this.data.connected || this.data.exportActive || this.data.clearPending) return
+    this.hardwareExport = createExport()
+    this.exportConnection = this.connectionSession
+    this.exportDevice = { id: this.data.deviceId, name: this.data.deviceName }
+    this.setData({ exportActive: true, exportCanSave: false, exportMessage: '正在请求硬件日志快照' })
+    this.armExportIdleTimeout()
+    this.exportTimer = setTimeout(() => this.endHardwareExport('导出超过 90 秒，未完整接收'), 90000)
+    const current = this.hardwareExport
+    const sent = await this.sendCommand('hwlog dump')
+    if (!sent && this.hardwareExport === current) this.endHardwareExport('日志导出请求发送失败')
+  },
+
+  endHardwareExport(reason) {
+    if (!this.hardwareExport) return
+    clearTimeout(this.exportTimer)
+    clearTimeout(this.exportIdleTimer)
+    const result = finishExport(this.hardwareExport, reason)
+    this.hardwareExport = null
+    this.hardwareSnapshot = { result, session: this.exportConnection, device: this.exportDevice, receivedAt: new Date().toISOString(), saved: false }
+    if (result.complete) {
+      this.setData({ exportMessage: `已完整接收 ${result.records.length} 条，正在保存` })
+      this.saveHardwareSnapshot(this.hardwareSnapshot)
+    } else {
+      this.setData({ exportActive: false, exportCanSave: true,
+        exportMessage: `导出不完整：${result.errors.join('；')}。已收到 ${result.records.length} 条，可保存已有记录后重试。` })
+    }
+  },
+
+  async saveHardwareSnapshot(snapshot) {
+    if (!snapshot || snapshot.saving) return
+    snapshot.saving = true
+    const result = snapshot.result
+    const header = result.header
+    const lines = ['Pico Cart Hardware Log Export',
+      `received_at=${snapshot.receivedAt}`, `device_name=${snapshot.device.name}`, `device_id=${snapshot.device.id}`,
+      `complete=${result.complete ? '1' : '0'}`, `received=${result.records.length}`, `expected=${header ? header.count : 'unknown'}`,
+      `fw=${header ? header.firmware : 'unknown'}`, `integrity_errors=${JSON.stringify(result.errors)}`,
+      'timestamps: t=uptime_ms; u=unix_ms (0 means unsynchronized; no wall-clock time inferred)', '', '[hardware_logs]']
+    if (header) lines.push(header.raw)
+    result.records.forEach((record) => lines.push(record.raw))
+    if (result.endLine) lines.push(result.endLine)
+    const content = `${lines.join('\n')}\n`
+    try {
+      const saved = await this.writeLogFile({ content,
+        fileName: `pico-hwlog_${formatFileTime(new Date())}_${Date.now()}_${result.complete ? 'complete' : 'partial'}.txt` })
+      snapshot.saved = true
+      this.hardwareSavedFile = saved
+      if (this.unloaded) return
+      if (this.hardwareSnapshot === snapshot) this.setData({ exportActive: false, exportCanSave: false,
+        hardwareFileName: saved.fileName, exportMessage: `${result.complete ? '完整' : '不完整'}日志已保存：${result.records.length} 条` })
+      if (result.complete && result.records.length && snapshot.session === this.connectionSession && this.data.connected && this.hardwareSnapshot === snapshot) {
+        const choice = await wxCall('showModal', { title: '日志已完整保存',
+          content: `已保存 ${result.records.length} 条到手机。是否清理硬件中这些已同步记录？同步后产生的新记录会保留。`, confirmText: '清理已同步', cancelText: '保留' })
+        if (choice.confirm && this.hardwareSnapshot === snapshot && snapshot.session === this.connectionSession && this.data.connected) {
+          await this.requestHardwareClear(header.last)
+        }
+      }
+    } catch (err) {
+      if (!this.unloaded && this.hardwareSnapshot === snapshot) this.setData({ exportActive: false, exportCanSave: true, exportMessage: `保存失败，可重试；硬件记录未清理。${err.errMsg || err.message || ''}` })
+    } finally {
+      snapshot.saving = false
+    }
+  },
+
+  saveReceivedHardwareLogs() {
+    this.saveHardwareSnapshot(this.hardwareSnapshot)
+  },
+
+  async clearHardwareLogs() {
+    if (!this.data.connected || this.data.exportActive || this.data.clearPending) return
+    const session = this.connectionSession
+    const choice = await wxCall('showModal', { title: '清空硬件 RAM 日志',
+      content: '这会删除硬件当前所有缓存记录，未同步的日志将无法恢复。是否继续？', confirmText: '确认清空', confirmColor: '#a63c2d' })
+    if (choice.confirm && session === this.connectionSession && this.data.connected) await this.requestHardwareClear()
+  },
+
+  async requestHardwareClear(last) {
+    if (!this.data.connected || this.data.exportActive || this.data.clearPending) return
+    const request = { session: this.connectionSession }
+    this.clearRequest = request
+    this.setData({ clearPending: true, diagnosticsMessage: '等待硬件确认清理结果' })
+    this.clearTimer = setTimeout(() => {
+      if (this.clearRequest !== request) return
+      this.clearRequest = null
+      this.setData({ clearPending: false, diagnosticsMessage: '未收到清理确认，结果未知；请刷新容量核对' })
+    }, 8000)
+    const sent = await this.sendCommand(last === undefined ? 'hwlog clear' : `hwlog clear ${last}`)
+    if (!sent && this.clearRequest === request) {
+      clearTimeout(this.clearTimer)
+      this.clearRequest = null
+      this.setData({ clearPending: false, diagnosticsMessage: '清理命令发送失败，请刷新核对' })
+    }
+  },
+
+  shareHardwareLogs() {
+    if (!this.hardwareSavedFile) return
+    this.shareSavedFile(this.hardwareSavedFile)
   },
 
   sendStatus() {
@@ -758,6 +1055,14 @@ Page({
 
   sendCustom() {
     const command = this.data.customCommand.trim()
+    if (/^hwlog\s+clear(?:\s|$)/.test(command)) {
+      this.clearHardwareLogs()
+      return
+    }
+    if (command === 'hwlog dump') {
+      this.exportHardwareLogs()
+      return
+    }
     if (command) {
       this.sendCommand(command)
     }
@@ -802,9 +1107,12 @@ Page({
       })
       return
     }
+    this.shareSavedFile({ filePath: this.lastLogFilePath, fileName: this.lastLogFileName, content: this.lastLogFileContent })
+  },
 
+  shareSavedFile(file) {
     if (!wx.shareFileMessage) {
-      wx.setClipboardData({ data: this.buildLogText() })
+      wx.setClipboardData({ data: file.content || this.buildLogText() })
       this.addLog('shareFileMessage unavailable, log copied')
       wx.showModal({
         title: '已复制日志',
@@ -815,8 +1123,8 @@ Page({
     }
 
     wx.shareFileMessage({
-      filePath: this.lastLogFilePath,
-      fileName: this.lastLogFileName || 'pico-cart-log.txt',
+      filePath: file.filePath,
+      fileName: file.fileName || 'pico-cart-log.txt',
       success: () => {
         this.addLog(`log shared ${this.lastLogFileName || this.lastLogFilePath}`)
       },

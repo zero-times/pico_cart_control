@@ -96,6 +96,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.material3.AlertDialog
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -278,6 +279,13 @@ private fun PicoCartApp(
         onTare = viewModel::sendTare,
         onIdentify = viewModel::sendIdentify,
         onExportHardwareLog = viewModel::exportHardwareLog,
+        onSyncClock = viewModel::syncDeviceClock,
+        onClearHardwareLog = viewModel::requestHardwareLogClear,
+        onShareHardwareLog = {
+            viewModel.shareHardwareLog(context)?.let { context.startActivity(Intent.createChooser(it, "分享硬件日志")) }
+        },
+        onConfirmClearHardwareLog = viewModel::confirmHardwareLogClear,
+        onDismissClearHardwareLog = viewModel::dismissHardwareLogClear,
         onToggleStream = viewModel::toggleStream,
         onPowerChange = viewModel::onPowerChange,
         onDrivePress = viewModel::holdDrive,
@@ -339,6 +347,11 @@ private fun PicoCartScreen(
     onTare: () -> Unit,
     onIdentify: () -> Unit,
     onExportHardwareLog: () -> Unit,
+    onSyncClock: () -> Unit,
+    onClearHardwareLog: () -> Unit,
+    onShareHardwareLog: () -> Unit,
+    onConfirmClearHardwareLog: () -> Unit,
+    onDismissClearHardwareLog: () -> Unit,
     onToggleStream: () -> Unit,
     onPowerChange: (Float) -> Unit,
     onDrivePress: (String) -> Unit,
@@ -358,6 +371,15 @@ private fun PicoCartScreen(
     onRunAgent: () -> Unit,
     onToggleMamboWake: () -> Unit,
 ) {
+    state.hardwareLogClearPrompt?.let { prompt ->
+        AlertDialog(
+            onDismissRequest = onDismissClearHardwareLog,
+            title = { Text("清理 Pico 日志") },
+            text = { Text(prompt) },
+            confirmButton = { TextButton(onClick = onConfirmClearHardwareLog) { Text("确认清理") } },
+            dismissButton = { TextButton(onClick = onDismissClearHardwareLog) { Text("保留日志") } },
+        )
+    }
     Box(Modifier.fillMaxSize()) {
         Scaffold(
             topBar = {
@@ -512,6 +534,9 @@ private fun PicoCartScreen(
                                 onTare = onTare,
                                 onIdentify = onIdentify,
                                 onExportHardwareLog = onExportHardwareLog,
+                                onSyncClock = onSyncClock,
+                                onClearHardwareLog = onClearHardwareLog,
+                                onShareHardwareLog = onShareHardwareLog,
                                 onToggleStream = onToggleStream,
                                 onStatus = onStatus,
                                 onAuto = onAuto,
@@ -1536,6 +1561,9 @@ private fun DebugActionSection(
     onTare: () -> Unit,
     onIdentify: () -> Unit,
     onExportHardwareLog: () -> Unit,
+    onSyncClock: () -> Unit,
+    onClearHardwareLog: () -> Unit,
+    onShareHardwareLog: () -> Unit,
     onToggleStream: () -> Unit,
     onStatus: () -> Unit,
     onAuto: () -> Unit,
@@ -1574,9 +1602,33 @@ private fun DebugActionSection(
                 if (state.hardwareLogExporting) "导出中" else "导出硬件日志",
                 Icons.Filled.Save,
                 onExportHardwareLog,
-                enabled = state.cartReady && !state.hardwareLogExporting,
+                enabled = state.cartReady && !state.hardwareLogExporting && !state.hardwareLogClearBusy,
             )
             ActionButton(if (state.streaming) "关流" else "开流", Icons.Filled.PlayArrow, onToggleStream, enabled = state.cartReady)
+        }
+        Spacer(Modifier.height(10.dp))
+        Text("固件版本：${state.firmwareVersion} · 时钟：${state.clockSyncStatus}",
+            style = MaterialTheme.typography.bodySmall)
+        Text(
+            if (state.hardwareLogUsedPercent == null) "Pico 日志 RAM：待读取"
+            else "Pico 日志 RAM：${state.hardwareLogUsed}/${state.hardwareLogCapacity} 条（${state.hardwareLogUsedPercent}%），已覆盖 ${state.hardwareLogOverwritten} 条",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        if ((state.hardwareLogUsedPercent ?: 0) >= 90) {
+            Text("Pico 日志空间即将用满，请手动导出保存。",
+                color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+        }
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            ActionButton(if (state.clockSyncing) "时钟同步中" else "重新同步时钟", Icons.Filled.Refresh,
+                onSyncClock, enabled = state.connected && !state.clockSyncing)
+            ActionButton(if (state.hardwareLogClearBusy) "清理中" else "清空 Pico 日志", Icons.Filled.Delete,
+                onClearHardwareLog, enabled = state.cartReady && !state.hardwareLogExporting && !state.hardwareLogClearBusy,
+                danger = true)
+        }
+        if (state.hardwareLogSavedPath.isNotBlank()) {
+            ActionButton("分享硬件日志", Icons.Filled.Share, onShareHardwareLog)
+            Text("保存位置：${state.hardwareLogSavedPath}",
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         Spacer(Modifier.height(10.dp))
         Text(

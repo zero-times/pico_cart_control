@@ -1,5 +1,11 @@
 from machine import Pin, PWM, UART
 from time import sleep_ms, ticks_ms, ticks_diff, ticks_add
+import sys
+
+try:
+    import select
+except ImportError:
+    import uselect as select
 
 try:
     import rp2
@@ -31,7 +37,8 @@ BLE_UART_BAUD = 115200
 BLE_STATE_PIN = 15
 BLE_STATE_ACTIVE_HIGH = True
 BLE_LINE_MAX = 160
-PROTOCOL_VERSION = "pico-cart-ble-2026-07-15-front-ir"
+PROTOCOL_VERSION = "pico-cart-ble-2026-09-10-diag"
+FIRMWARE_VERSION = "0.2.0"
 
 # HX711 modules. Each S-type load cell uses one HX711.
 LEFT_HX711_DOUT = 6
@@ -127,7 +134,7 @@ FILTER_ALPHA = 0.22
 MAX_SAFE_RAW = 650000
 
 # Print USB debug line every N ms.
-DEBUG_EVERY_MS = 250
+DEBUG_EVERY_MS = 1000
 
 # Send status over Bluetooth only after "stream on" to avoid flooding phones.
 BLE_STREAM_DEFAULT = False
@@ -149,7 +156,9 @@ HARDWARE_LOG_CAPACITY = 192
 HARDWARE_LOG_SNAPSHOT_MS = 250
 HARDWARE_LOG_OVERRUN_MS = 100
 HARDWARE_LOG_OVERRUN_REPEAT_MS = 1000
-HARDWARE_LOG_MAX_RECORD_CHARS = 124
+HARDWARE_LOG_MAX_RECORD_CHARS = 288
+DIAGNOSTIC_TX_CHUNK = 96
+DIAGNOSTIC_QUEUE_CAPACITY = 8
 
 # Set True when you only want to test the motor driver without HX711 sensors.
 MOTOR_TEST_MODE = False
@@ -218,6 +227,11 @@ class BluetoothSerial:
         self.state = None
         self.buffer = ""
         self.last_connected = -1
+        self.hardware_log = None
+        self.tx_queue = []
+        self.tx_offset = 0
+        self.last_error_ms = None
+        self.discard_line = False
 
         if not BLE_ENABLED:
             return
@@ -259,17 +273,54 @@ class BluetoothSerial:
             return now
         return None
 
+    def record_error(self, event, detail):
+        now = ticks_ms()
+        if self.hardware_log is not None and (
+                self.last_error_ms is None or
+                ticks_diff(now, self.last_error_ms) >= 1000):
+            self.last_error_ms = now
+            self.hardware_log.event(event, "detail={}".format(str(detail).replace(" ", "_")))
+
+    def reset_connection_buffers(self):
+        self.buffer = ""
+        self.discard_line = False
+        self.tx_queue = []
+        self.tx_offset = 0
+
     def write(self, text, force=False):
         if self.uart is None:
-            return
+            return False
         if not force and self.state is not None and self.connected() == 0:
-            return
+            return False
+        if len(self.tx_queue) >= DIAGNOSTIC_QUEUE_CAPACITY:
+            self.record_error("uart_tx_full", "queue")
+            return False
         if not text.endswith("\n"):
             text += "\n"
+        self.tx_queue.append(text.encode("utf-8"))
+        return True
+
+    def flush(self):
+        # Bound serial work per control-loop iteration. Keep partial writes on
+        # the same line so replies cannot be interleaved with an exported row.
+        if not self.tx_queue or self.uart is None:
+            return
         try:
-            self.uart.write(text)
+            data = self.tx_queue[0]
+            chunk = data[self.tx_offset:self.tx_offset + DIAGNOSTIC_TX_CHUNK]
+            written = self.uart.write(chunk) or 0
+            if written < 0 or written > len(chunk):
+                raise OSError("invalid_write_count")
+            self.tx_offset += written
+            if written < len(chunk):
+                self.record_error("uart_write_short", "n={}".format(written))
+            if self.tx_offset == len(data):
+                self.tx_queue.pop(0)
+                self.tx_offset = 0
         except Exception as err:
-            print("ble_write_error={}".format(err))
+            self.record_error("uart_write_error", err)
+            self.tx_queue = []
+            self.tx_offset = 0
 
     def poll_lines(self):
         lines = []
@@ -280,9 +331,9 @@ class BluetoothSerial:
             count = self.uart.any()
             if not count:
                 return lines
-            data = self.uart.read(count)
+            data = self.uart.read(min(count, 256))
         except Exception as err:
-            print("ble_read_error={}".format(err))
+            self.record_error("uart_read_error", err)
             return lines
 
         if not data:
@@ -291,18 +342,22 @@ class BluetoothSerial:
         try:
             chunk = data.decode("utf-8")
         except Exception:
+            self.record_error("uart_decode_error", "utf8")
             chunk = ""
 
         for ch in chunk:
             if ch == "\r" or ch == "\n":
                 line = self.buffer.strip()
                 self.buffer = ""
-                if line:
+                if line and not self.discard_line:
                     lines.append(line)
-            elif 32 <= ord(ch) <= 126:
+                self.discard_line = False
+            elif 32 <= ord(ch) <= 126 and not self.discard_line:
                 self.buffer += ch
                 if len(self.buffer) > BLE_LINE_MAX:
-                    self.buffer = self.buffer[-BLE_LINE_MAX:]
+                    self.buffer = ""
+                    self.discard_line = True
+                    self.record_error("uart_rx_long", "discard_line")
 
         return lines
 
@@ -552,30 +607,158 @@ class FrontObstacleSensor:
         return self.blocked
 
 
+class DiagnosticClock:
+    """Wall-clock labels never change the ticks used by motor safety timers."""
+
+    def __init__(self):
+        self.last_tick = ticks_ms()
+        self.elapsed = 0
+        self.anchor_uptime = 0
+        self.anchor_unix = None
+
+    def uptime_ms(self, now=None):
+        now = ticks_ms() if now is None else now
+        delta = ticks_diff(now, self.last_tick)
+        # Soft IRQ events can arrive between reads of the loop's timestamp.
+        if delta >= 0:
+            self.elapsed += delta
+            self.last_tick = now
+        return self.elapsed
+
+    def unix_ms(self, uptime=None):
+        uptime = self.uptime_ms() if uptime is None else uptime
+        if self.anchor_unix is None:
+            return 0
+        return self.anchor_unix + uptime - self.anchor_uptime
+
+    def sync(self, unix_ms):
+        # Unix milliseconds (2020..2100), independent of MicroPython's epoch.
+        if not 1577836800000 <= unix_ms <= 4102444800000:
+            raise ValueError("time_range")
+        self.anchor_uptime = self.uptime_ms()
+        self.anchor_unix = unix_ms
+
+    def status_line(self):
+        uptime = self.uptime_ms()
+        return "time synced={} unix_ms={} uptime_ms={} fw={}".format(
+            bool_text(self.anchor_unix is not None), self.unix_ms(uptime),
+            uptime, FIRMWARE_VERSION)
+
+
+class UsbDiagnostics:
+    """Bounded, polled USB CDC I/O; no input waits or per-event prints."""
+
+    def __init__(self, stdin=None, stdout=None):
+        self.stdin = sys.stdin if stdin is None else stdin
+        self.stdout = sys.stdout if stdout is None else stdout
+        self.rx = ""
+        self.discard_line = False
+        self.queue = []
+        self.offset = 0
+        self.dropped = 0
+        self.input_poll = None
+        self.output_poll = None
+        try:
+            self.input_poll = select.poll()
+            self.input_poll.register(self.stdin, select.POLLIN)
+            self.output_poll = select.poll()
+            self.output_poll.register(self.stdout, select.POLLOUT)
+        except (OSError, ValueError, TypeError, AttributeError):
+            self.input_poll = None
+            self.output_poll = None
+
+    def write(self, line):
+        if self.output_poll is None or len(self.queue) >= DIAGNOSTIC_QUEUE_CAPACITY:
+            self.dropped += 1
+            return False
+        self.queue.append(line + "\n")
+        return True
+
+    def poll_lines(self):
+        lines = []
+        if self.input_poll is None:
+            return lines
+        for _ in range(64):
+            if not any(event[1] & select.POLLIN for event in self.input_poll.poll(0)):
+                break
+            char = self.stdin.read(1)
+            if not char:
+                break
+            if char in ("\n", "\r"):
+                if self.rx.strip() and not self.discard_line:
+                    lines.append(self.rx.strip())
+                self.rx = ""
+                self.discard_line = False
+            elif 32 <= ord(char) <= 126 and not self.discard_line:
+                self.rx += char
+                if len(self.rx) > BLE_LINE_MAX:
+                    self.rx = ""
+                    self.discard_line = True
+        return lines
+
+    def flush(self):
+        if self.output_poll is None:
+            return
+        if not self.queue and self.dropped:
+            dropped = self.dropped
+            self.dropped = 0
+            self.write("usb_dropped n={} fw={}".format(dropped, FIRMWARE_VERSION))
+        if not self.queue:
+            return
+        try:
+            if not any(event[1] & select.POLLOUT for event in self.output_poll.poll(0)):
+                return
+            line = self.queue[0]
+            chunk = line[self.offset:self.offset + DIAGNOSTIC_TX_CHUNK]
+            written = self.stdout.write(chunk) or 0
+            self.offset += written
+            if self.offset >= len(line):
+                self.queue.pop(0)
+                self.offset = 0
+        except (OSError, ValueError):
+            # A detached USB host must not interrupt motor protection.
+            self.dropped += len(self.queue)
+            self.queue = []
+            self.offset = 0
+
+
 class HardwareLogger:
     def __init__(self):
         self.records = [None] * HARDWARE_LOG_CAPACITY
         self.head = 0
         self.count = 0
         self.sequence = 1
+        self.clock = DiagnosticClock()
+        self.usb = None
+        self.overwritten = 0
         self.last_snapshot_ms = ticks_ms()
         self.last_state = ""
         self.last_overrun_ms = 0
         self.export_records = None
         self.export_index = 0
+        self.export_id = 0
+        self.export_last = 0
+        self.export_channel = None
 
     def event(self, event, fields="", now=None):
         now = ticks_ms() if now is None else now
-        record = "s={} t={} e={}".format(self.sequence, now, event)
+        uptime = self.clock.uptime_ms(now)
+        record = "s={} t={} u={} fw={} e={}".format(
+            self.sequence, uptime, self.clock.unix_ms(uptime), FIRMWARE_VERSION, event)
         if fields:
             record += " " + fields.replace("\r", "_").replace("\n", "_")
         record = record[:HARDWARE_LOG_MAX_RECORD_CHARS]
+        if self.count == HARDWARE_LOG_CAPACITY:
+            self.overwritten += 1
         self.records[self.head] = record
         self.head = (self.head + 1) % HARDWARE_LOG_CAPACITY
         self.count = min(self.count + 1, HARDWARE_LOG_CAPACITY)
         self.sequence += 1
+        if self.usb is not None and event != "snap":
+            self.usb.write("usb_log " + record)
 
     def observe(self, controller, now):
+        self.clock.uptime_ms(now)
         state_fields = (
             "mode={} drive={} sensor={} err={} unsafe={} tow={} bt={} front={}"
         ).format(
@@ -621,23 +804,56 @@ class HardwareLogger:
             self.last_overrun_ms = now
             self.event("loop_overrun", "ms={}".format(elapsed_ms), now)
 
-    def begin_export(self):
-        self.event("hwlog_dump", "n={}".format(self.count))
+    def begin_export(self, channel="ble"):
+        if self.export_records is not None:
+            return None
         start = (self.head - self.count) % HARDWARE_LOG_CAPACITY
         self.export_records = [
             self.records[(start + index) % HARDWARE_LOG_CAPACITY]
             for index in range(self.count)
         ]
         self.export_index = 0
+        self.export_id += 1
+        self.export_last = self.sequence - 1
+        self.export_channel = channel
         return len(self.export_records)
 
-    def clear(self):
-        self.records = [None] * HARDWARE_LOG_CAPACITY
-        self.head = 0
-        self.count = 0
+    def cancel_export(self):
         self.export_records = None
         self.export_index = 0
-        self.event("hwlog_clear")
+        self.export_channel = None
+
+    def clear(self, through=None):
+        if self.export_records is not None:
+            raise ValueError("hwlog_busy")
+        if through is None:
+            through = self.sequence - 1
+        if through < 0 or through >= self.sequence:
+            raise ValueError("hwlog_sequence")
+        # Records are consecutive in the ring. Drop only the exported prefix;
+        # events generated during transfer must survive a confirmed cleanup.
+        first = self.sequence - self.count
+        remove = min(self.count, max(0, through - first + 1))
+        start = (self.head - self.count) % HARDWARE_LOG_CAPACITY
+        for index in range(remove):
+            self.records[(start + index) % HARDWARE_LOG_CAPACITY] = None
+        self.count -= remove
+        self.event("hwlog_clear", "through={} removed={}".format(through, remove))
+        return self.count
+
+    def status_line(self):
+        return (
+            "ok hwlog_status n={} cap={} used_pct={} overwritten={} "
+            "exporting={} fw={} synced={}"
+        ).format(
+            self.count, HARDWARE_LOG_CAPACITY,
+            self.count * 100 // HARDWARE_LOG_CAPACITY, self.overwritten,
+            bool_text(self.export_records is not None), FIRMWARE_VERSION,
+            bool_text(self.clock.anchor_unix is not None))
+
+    def export_start_line(self):
+        return "ok hwlog_export n={} x={} last={} fw={}".format(
+            len(self.export_records), self.export_id, self.export_last, FIRMWARE_VERSION)
 
     def next_export_line(self):
         if self.export_records is None:
@@ -646,10 +862,12 @@ class HardwareLogger:
         if self.export_index < total:
             self.export_index += 1
             record = self.export_records[self.export_index - 1]
-            return "hwlog i={} n={} {}".format(self.export_index, total, record)
-        self.export_records = None
-        self.export_index = 0
-        return "hwlog_end n={}".format(total)
+            return "hwlog x={} i={} n={} {}".format(
+                self.export_id, self.export_index, total, record)
+        line = "hwlog_end n={} x={} last={} fw={}".format(
+            total, self.export_id, self.export_last, FIRMWARE_VERSION)
+        self.cancel_export()
+        return line
 
 
 def safe_force(raw, sign):
@@ -1166,10 +1384,11 @@ class CartController:
 
     def info_line(self):
         return (
-            "info proto={} uart=UART{} tx=GP{} rx=GP{} state=GP{} "
+            "info proto={} fw={} uart=UART{} tx=GP{} rx=GP{} state=GP{} "
             "right_inb=GP{} front=GP{} front_active={} tow_start={}"
         ).format(
             PROTOCOL_VERSION,
+            FIRMWARE_VERSION,
             BLE_UART_ID,
             BLE_UART_TX,
             BLE_UART_RX,
@@ -1187,9 +1406,12 @@ class CommandInterface:
         self.ble = ble
         self.status_led = status_led
         self.stream = BLE_STREAM_DEFAULT
+        self.last_command = ""
+        self.last_command_ms = ticks_ms()
 
     def reply(self, text, force=False):
-        print("ble_reply={}".format(text))
+        if self.controller.hardware_log.usb is not None:
+            self.controller.hardware_log.usb.write("ble_reply=" + text)
         self.ble.write(text, force=force)
 
     def send_hello(self):
@@ -1197,9 +1419,60 @@ class CommandInterface:
         self.reply(self.controller.param_line())
         self.reply(self.controller.status_line())
 
+    def handle_diagnostic(self, parts, reply, channel):
+        command = parts[0].lower()
+        log = self.controller.hardware_log
+        if command == "time":
+            if len(parts) == 2 and parts[1] == "status":
+                reply(log.clock.status_line())
+            elif len(parts) == 3 and parts[1] == "sync" and channel == "ble":
+                requested = int(parts[2])
+                log.clock.sync(requested)
+                log.event("time_sync", "source=phone")
+                reply(log.clock.status_line() + " request_ms={}".format(requested))
+            else:
+                reply("err time_usage")
+            return True
+        if command not in ("hwlog", "diag"):
+            return False
+        action = parts[1].lower() if len(parts) >= 2 else ""
+        if action in ("dump", "export") and len(parts) == 2:
+            total = log.begin_export(channel)
+            if total is None:
+                reply("err hwlog_busy")
+            else:
+                reply(log.export_start_line())
+        elif action == "status" and len(parts) == 2:
+            reply(log.status_line())
+        elif action == "clear" and len(parts) in (2, 3) and channel == "ble":
+            remaining = log.clear(int(parts[2]) if len(parts) == 3 else None)
+            reply("ok hwlog_clear n={}".format(remaining))
+        else:
+            reply("err hwlog_usage")
+        return True
+
+    def handle_usb(self, line):
+        usb = self.controller.hardware_log.usb
+        parts = line.strip().split()
+        if not parts or usb is None:
+            return
+        # USB is a developer diagnostic channel, never a second drive source.
+        allowed = line.strip().lower() in (
+            "info", "ver", "status", "time status", "hwlog status", "hwlog dump")
+        if not allowed:
+            usb.write("err usb_read_only")
+            return
+        try:
+            if self.handle_diagnostic(parts, usb.write, "usb"):
+                return
+            usb.write(self.controller.status_line() if parts[0] == "status"
+                      else self.controller.info_line())
+        except Exception as err:
+            usb.write("err {}".format(err))
+
     def help(self):
         self.reply(
-            "help cmd: ver info pins status param stream on|off hwlog dump|clear|status identify [S] tow auto manual idle stop softstop keepalive tare drive L R f [P] b [P] l [P] r [P] motor SIDE DIR [P] [MS] set NAME VALUE"
+            "help cmd: ver info pins status param time sync MS|status stream on|off hwlog dump|clear [SEQ]|status identify [S] tow auto manual idle stop softstop keepalive tare drive L R f [P] b [P] l [P] r [P] motor SIDE DIR [P] [MS] set NAME VALUE"
         )
         self.reply(
             "help set: max_pwm min_pwm start_raw full_raw steer_gain ramp decel_ramp manual_max timeout_ms reverse_neutral_ms left_motor_gain right_motor_gain left_force_gain right_force_gain tow_left_comp tow_right_comp"
@@ -1392,17 +1665,22 @@ class CommandInterface:
             self.reply("err front_obstacle")
 
     def handle(self, line):
-        print("ble_cmd={}".format(line))
         self.status_led.pulse()
         parts = line.strip().split()
         if not parts:
             return
 
         command = parts[0].lower()
-        if command not in ("keepalive", "status"):
+        now = ticks_ms()
+        if command not in ("keepalive", "status", "hwlog", "diag", "time") and (
+                command != self.last_command or ticks_diff(now, self.last_command_ms) >= 500):
             self.controller.hardware_log.event("command", "name={}".format(command))
+            self.last_command = command
+            self.last_command_ms = now
 
         try:
+            if self.handle_diagnostic(parts, self.reply, "ble"):
+                return
             if command == "help" or command == "?":
                 self.help()
             elif command == "ver" or command == "info":
@@ -1431,25 +1709,6 @@ class CommandInterface:
                     self.reply("ok stream=off")
                 else:
                     self.reply("err usage: stream on|off")
-            elif command == "hwlog" or command == "diag":
-                action = parts[1].lower() if len(parts) == 2 else ""
-                if action == "dump" or action == "export":
-                    total = self.controller.hardware_log.begin_export()
-                    self.reply("ok hwlog_export n={}".format(total))
-                elif action == "clear":
-                    self.controller.hardware_log.clear()
-                    self.reply("ok hwlog_clear")
-                elif action == "status":
-                    self.reply(
-                        "ok hwlog_status n={} exporting={}".format(
-                            self.controller.hardware_log.count,
-                            bool_text(
-                                self.controller.hardware_log.export_records is not None
-                            ),
-                        )
-                    )
-                else:
-                    self.reply("err usage: hwlog dump|clear|status")
             elif command == "auto" or command == "tow":
                 if not self.controller.sensor_ok:
                     self.controller.stop(MODE_IDLE)
@@ -1550,6 +1809,9 @@ def main():
     ble = BluetoothSerial()
     estop = Pin(ESTOP_PIN, Pin.IN, Pin.PULL_UP)
     hardware_log = HardwareLogger()
+    usb = UsbDiagnostics()
+    hardware_log.usb = usb
+    ble.hardware_log = hardware_log
     front_obstacle = FrontObstacleSensor(
         Pin(FRONT_OBSTACLE_PIN, Pin.IN, Pin.PULL_UP)
     )
@@ -1567,7 +1829,7 @@ def main():
         RIGHT_MOTOR_REVERSE,
     )
 
-    print("Pico BLE traction cart controller")
+    print("Pico BLE traction cart controller fw={}".format(FIRMWARE_VERSION))
     print(
         "ble_uart=UART{} tx=GP{} rx=GP{} baud={} state=GP{}".format(
             BLE_UART_ID, BLE_UART_TX, BLE_UART_RX, BLE_UART_BAUD, BLE_STATE_PIN
@@ -1585,7 +1847,11 @@ def main():
     led_mode = StatusLed(led, ble)
 
     if MOTOR_TEST_MODE:
-        run_motor_test(left_motor, right_motor, front_obstacle, led_mode)
+        try:
+            run_motor_test(left_motor, right_motor, front_obstacle, led_mode)
+        finally:
+            left_motor.stop()
+            right_motor.stop()
 
     left_hx = HX711(LEFT_HX711_DOUT, LEFT_HX711_SCK)
     right_hx = HX711(RIGHT_HX711_DOUT, RIGHT_HX711_SCK)
@@ -1608,52 +1874,84 @@ def main():
 
     last_debug = ticks_ms()
     last_ble_stream = ticks_ms()
+    export_started_ms = None
 
-    while True:
-        loop_started_ms = ticks_ms()
-        now = ticks_ms()
-        led_mode.update(now)
+    try:
+        while True:
+            loop_started_ms = ticks_ms()
+            now = ticks_ms()
+            led_mode.update(now)
 
-        connection_event = ble.connection_event()
-        if connection_event == 1:
-            print("ble_connected=1")
-            hardware_log.event("ble_connect")
-            if controller.mode == MODE_AUTO:
-                controller.stop(MODE_IDLE, "ble_connect_auto_reset")
-            commands.send_hello()
-        elif connection_event == 0:
-            print("ble_connected=0")
-            hardware_log.event("ble_disconnect")
-            if controller.mode == MODE_MANUAL or controller.mode == MODE_AUTO:
-                controller.stop(MODE_IDLE, "ble_disconnect")
+            connection_event = ble.connection_event()
+            if connection_event == 1:
+                ble.reset_connection_buffers()
+                hardware_log.event("ble_connect", "state=1 cause=unknown")
+                if controller.mode == MODE_AUTO:
+                    controller.stop(MODE_IDLE, "ble_connect_auto_reset")
+                commands.send_hello()
+            elif connection_event == 0:
+                ble.reset_connection_buffers()
+                if hardware_log.export_channel == "ble":
+                    hardware_log.cancel_export()
+                    hardware_log.event("hwlog_interrupted", "reason=ble_disconnect")
+                hardware_log.event("ble_disconnect", "state=0 cause=unknown")
+                if controller.mode == MODE_MANUAL or controller.mode == MODE_AUTO:
+                    controller.stop(MODE_IDLE, "ble_disconnect")
 
-        for line in ble.poll_lines():
-            commands.handle(line)
+            for line in ble.poll_lines():
+                commands.handle(line)
 
-        controller.update(now)
+            controller.update(now)
 
-        now = ticks_ms()
-        controller.last_loop_ms = max(0, ticks_diff(now, loop_started_ms))
-        hardware_log.record_loop_time(controller.last_loop_ms, now)
-        led_mode.update(now)
+            for line in usb.poll_lines():
+                commands.handle_usb(line)
 
-        if ticks_diff(now, last_debug) >= DEBUG_EVERY_MS:
-            last_debug = now
-            print(controller.status_line())
+            now = ticks_ms()
+            controller.last_loop_ms = max(0, ticks_diff(now, loop_started_ms))
+            hardware_log.record_loop_time(controller.last_loop_ms, now)
+            led_mode.update(now)
 
-        if commands.stream and ticks_diff(now, last_ble_stream) >= BLE_STREAM_EVERY_MS:
-            last_ble_stream = now
-            ble.write(controller.status_line())
+            if ticks_diff(now, last_debug) >= DEBUG_EVERY_MS:
+                last_debug = now
+                usb.write("usb_status fw={} {}".format(FIRMWARE_VERSION, controller.status_line()))
 
-        if ble.connected() == 1:
-            hardware_line = hardware_log.next_export_line()
-            if hardware_line is not None:
-                ble.write(hardware_line)
+            if (commands.stream and hardware_log.export_records is None and
+                    ticks_diff(now, last_ble_stream) >= BLE_STREAM_EVERY_MS):
+                last_ble_stream = now
+                ble.write(controller.status_line())
 
-        sleep_ms(LOOP_MS)
+            if hardware_log.export_records is not None:
+                if export_started_ms is None:
+                    export_started_ms = now
+                channel = hardware_log.export_channel
+                transport = ble if channel == "ble" else usb
+                queue = ble.tx_queue if channel == "ble" else usb.queue
+                if ticks_diff(now, export_started_ms) > 60000:
+                    hardware_log.cancel_export()
+                    hardware_log.event("hwlog_interrupted", "reason=timeout channel=" + channel)
+                elif not queue and (channel == "usb" or ble.connected() != 0):
+                    hardware_line = hardware_log.next_export_line()
+                    if not transport.write(hardware_line):
+                        hardware_log.cancel_export()
+                        hardware_log.event("hwlog_interrupted", "reason=transport channel=" + channel)
+            else:
+                export_started_ms = None
+
+            ble.flush()
+            usb.flush()
+            # Include diagnostic output work in the measured loop latency.
+            controller.last_loop_ms = max(0, ticks_diff(ticks_ms(), loop_started_ms))
+            hardware_log.record_loop_time(controller.last_loop_ms, ticks_ms())
+
+            sleep_ms(LOOP_MS)
+
+    finally:
+        # Ctrl-C/REPL entry and unexpected failures must de-energize both motors.
+        controller.stop(MODE_IDLE, "shutdown")
 
 
-try:
-    main()
-except KeyboardInterrupt:
-    print("stopped")
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("stopped fw={}".format(FIRMWARE_VERSION))

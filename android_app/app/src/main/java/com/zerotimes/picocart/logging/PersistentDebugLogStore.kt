@@ -1,6 +1,7 @@
 package com.zerotimes.picocart.logging
 
 import android.content.Context
+import android.os.Environment
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -10,7 +11,9 @@ import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -38,6 +41,28 @@ internal class PersistentDebugLogStore(context: Context) {
 
     fun appendHardware(message: String) {
         append(appLogFile, "hardware", message)
+    }
+
+    /** Unlike background debug logging, callers must observe durable-save failures before clearing Pico. */
+    suspend fun saveHardwareSnapshot(lines: List<String>, metadata: String): File = withContext(Dispatchers.IO) {
+        val directory = (appContext.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS)
+            ?: appContext.filesDir.resolve("logs")).resolve("hardware")
+        check(directory.isDirectory || directory.mkdirs()) { "无法创建硬件日志目录" }
+        val temporary = File.createTempFile("pico_hardware_${System.currentTimeMillis()}_", ".partial", directory)
+        val destination = File(directory, temporary.name.removeSuffix(".partial") + ".log")
+        val bytes = (metadata + "\n" + lines.joinToString("\n", postfix = "\n")).toByteArray(Charsets.UTF_8)
+        try {
+            FileOutputStream(temporary).use { output ->
+                output.write(bytes)
+                output.flush()
+                output.fd.sync()
+            }
+            check(temporary.renameTo(destination)) { "无法完成硬件日志保存" }
+            check(destination.length() == bytes.size.toLong()) { "硬件日志保存不完整" }
+            destination
+        } finally {
+            temporary.delete()
+        }
     }
 
     fun appendAgent(role: String, message: String, ok: Boolean?) {
