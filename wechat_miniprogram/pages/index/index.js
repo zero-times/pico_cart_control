@@ -154,6 +154,7 @@ Page({
     status: {
       mode: '-',
       sensor: '-',
+      tared: '0',
       err: '-',
       lraw: '0',
       rraw: '0',
@@ -172,7 +173,12 @@ Page({
     calStatus: '未读取',
     calSaving: false,
     savedLeftGain: '-',
-    savedRightGain: '-'
+    savedRightGain: '-',
+    savedLeftForceGain: '-',
+    savedRightForceGain: '-',
+    savedStartRaw: '-',
+    savedFullRaw: '-',
+    tareStatus: '上电后需重新归零，上次零点不会自动恢复'
   },
 
   writeBusy: false,
@@ -662,17 +668,32 @@ Page({
         calSaving: false,
         calStatus: parsed.err && parsed.err !== '-' ? `校准文件不可用：${parsed.err}` : `已保存=${parsed.loaded === '1' ? '是' : '否'}，未保存改动=${parsed.dirty === '1' ? '有' : '无'}`,
         savedLeftGain: parsed.saved_left_motor_gain || this.data.savedLeftGain,
-        savedRightGain: parsed.saved_right_motor_gain || this.data.savedRightGain
+        savedRightGain: parsed.saved_right_motor_gain || this.data.savedRightGain,
+        savedLeftForceGain: parsed.saved_left_force_gain || this.data.savedLeftForceGain,
+        savedRightForceGain: parsed.saved_right_force_gain || this.data.savedRightForceGain,
+        savedStartRaw: parsed.saved_start_raw || this.data.savedStartRaw,
+        savedFullRaw: parsed.saved_full_raw || this.data.savedFullRaw
       })
     } else if (parsed.type === 'ok' && /^ok cal_save(?:\s|$)/.test(line)) {
+      const group = parsed.group || ''
       this.setData({
         calSaving: false,
-        calStatus: `已保存左右轮增益 ${parsed.left_motor_gain || '-'} / ${parsed.right_motor_gain || '-'}`,
+        calStatus: group === 'force'
+          ? `已保存拉力增益 ${parsed.left_force_gain || '-'} / ${parsed.right_force_gain || '-'}，阈值 ${parsed.start_raw || '-'} / ${parsed.full_raw || '-'}`
+          : `已保存左右轮增益 ${parsed.left_motor_gain || '-'} / ${parsed.right_motor_gain || '-'}`,
         savedLeftGain: parsed.left_motor_gain || this.data.savedLeftGain,
-        savedRightGain: parsed.right_motor_gain || this.data.savedRightGain
+        savedRightGain: parsed.right_motor_gain || this.data.savedRightGain,
+        savedLeftForceGain: parsed.left_force_gain || this.data.savedLeftForceGain,
+        savedRightForceGain: parsed.right_force_gain || this.data.savedRightForceGain,
+        savedStartRaw: parsed.start_raw || this.data.savedStartRaw,
+        savedFullRaw: parsed.full_raw || this.data.savedFullRaw
       })
+    } else if (parsed.type === 'ok' && /^ok tare(?:\s|$)/.test(line)) {
+      this.setData({ tareStatus: `归零成功。零点读数左 ${parsed.lraw || parsed.l || '0'} / 右 ${parsed.rraw || parsed.r || '0'}` })
     } else if (parsed.type === 'err' && /^err cal/.test(line)) {
       this.setData({ calSaving: false, calStatus: `保存失败：${line}` })
+    } else if (parsed.type === 'err' && /tare|sensor_not_ready/.test(line)) {
+      this.setData({ tareStatus: `归零或牵引失败：${line}` })
     } else if (parsed.type === 'info') {
       this.setData({ info: parsed, firmware: parsed.fw || this.data.firmware })
     } else if (parsed.type === 'ok' && parsed.stream) {
@@ -1131,6 +1152,13 @@ Page({
     this.setData({ calSaving: true, calStatus: '正在停车并保存轮速增益' })
     this.sendCommand('stop')
     this.sendCommand('cal save motor')
+  },
+
+  saveForceCalibration() {
+    if (this.data.calSaving) return
+    this.setData({ calSaving: true, calStatus: '正在停车并保存拉力增益和阈值' })
+    this.sendCommand('stop')
+    this.sendCommand('cal save force')
   },
 
   onCustomInput(event) {

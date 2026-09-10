@@ -310,6 +310,32 @@ class DiagnosticsTests(unittest.TestCase):
         self.addCleanup(lambda: [Path(name).unlink(missing_ok=True) for name in (
             "_cal_test.cfg", "_cal_test.cfg.tmp", "_cal_bad.cfg", "_cal_bad.cfg.tmp")])
 
+    def test_force_thresholds_and_save_keep_motor_gains(self):
+        store = fw.CalibrationStore(path="_force_cal.cfg", temp_path="_force_cal.cfg.tmp")
+        fw.apply_calibration_values({"left_motor_gain": 0.88, "right_motor_gain": 1.05})
+        store.save(fw.current_calibration_values())
+        with self.assertRaisesRegex(ValueError, "threshold_order"):
+            fw.apply_calibration_values({"start_raw": 50000, "full_raw": 40000}, source="runtime")
+        fw.apply_calibration_values({"left_force_gain": 1.2, "right_force_gain": 0.9, "start_raw": 18000, "full_raw": 140000})
+        values = dict(store.saved)
+        for name in fw.CALIBRATION_GROUPS["force"]:
+            values[name] = fw.current_calibration_values()[name]
+        saved = store.save(values)
+        self.assertEqual(saved["left_motor_gain"], 0.88)
+        self.assertEqual(saved["left_force_gain"], 1.2)
+        self.assertEqual(saved["start_raw"], 18000)
+        reloaded = store.load()
+        self.assertEqual(reloaded["right_motor_gain"], 1.05)
+        self.assertEqual(reloaded["full_raw"], 140000)
+        interface, log = self.make_interface()
+        interface.controller.mode = fw.MODE_IDLE
+        interface.controller.tared = False
+        interface.controller.sensor_ok = False
+        interface.controller.sensor_error = "not_tared"
+        interface.handle("tow")
+        self.assertTrue(interface.ble.write.call_args.args[0].startswith("err sensor_not_ready"))
+        self.addCleanup(lambda: [Path(name).unlink(missing_ok=True) for name in ("_force_cal.cfg", "_force_cal.cfg.tmp")])
+
     def test_usb_partial_output_and_drop_accounting(self):
         usb = fw.UsbDiagnostics.__new__(fw.UsbDiagnostics)
         usb.stdout, usb.output_poll = Mock(), Mock()

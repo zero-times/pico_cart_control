@@ -40,8 +40,8 @@ BLE_STATE_ACTIVE_HIGH = True
 BLE_LINE_MAX = 160
 # Ignore STATE pin glitches; a real drop still stops well before timeout_ms.
 BLE_STATE_DEBOUNCE_MS = 80
-PROTOCOL_VERSION = "pico-cart-ble-2026-09-10-cal"
-FIRMWARE_VERSION = "0.2.2"
+PROTOCOL_VERSION = "pico-cart-ble-2026-09-10-force"
+FIRMWARE_VERSION = "0.2.3"
 
 # HX711 modules. Each S-type load cell uses one HX711.
 LEFT_HX711_DOUT = 6
@@ -277,10 +277,8 @@ def apply_calibration_values(values, source="runtime"):
         applied["right_force_gain"] = RIGHT_FORCE_GAIN
     start_raw = validate_calibration_value("start_raw", values.get("start_raw", PULL_START_RAW))
     full_raw = validate_calibration_value("full_raw", values.get("full_raw", PULL_FULL_RAW))
-    if full_raw <= start_raw:
-        if source == "file":
-            raise ValueError("threshold_order")
-        full_raw = start_raw + 1
+    if ("start_raw" in values or "full_raw" in values) and full_raw <= start_raw:
+        raise ValueError("threshold_order")
     if "start_raw" in values or "full_raw" in values:
         PULL_START_RAW = start_raw
         PULL_FULL_RAW = full_raw
@@ -384,7 +382,11 @@ class CalibrationStore:
         return (
             "cal fmt={} loaded={} dirty={} err={} "
             "left_motor_gain={} right_motor_gain={} "
-            "saved_left_motor_gain={} saved_right_motor_gain={}"
+            "saved_left_motor_gain={} saved_right_motor_gain={} "
+            "left_force_gain={} right_force_gain={} start_raw={} full_raw={} "
+            "saved_left_force_gain={} saved_right_force_gain={} "
+            "saved_start_raw={} saved_full_raw={} "
+            "tow_left_comp={} tow_right_comp={}"
         ).format(
             CALIBRATION_FORMAT,
             "1" if self.loaded else "0",
@@ -394,6 +396,16 @@ class CalibrationStore:
             format_calibration_value("right_motor_gain", current["right_motor_gain"]),
             format_calibration_value("left_motor_gain", self.saved["left_motor_gain"]),
             format_calibration_value("right_motor_gain", self.saved["right_motor_gain"]),
+            format_calibration_value("left_force_gain", current["left_force_gain"]),
+            format_calibration_value("right_force_gain", current["right_force_gain"]),
+            format_calibration_value("start_raw", current["start_raw"]),
+            format_calibration_value("full_raw", current["full_raw"]),
+            format_calibration_value("left_force_gain", self.saved["left_force_gain"]),
+            format_calibration_value("right_force_gain", self.saved["right_force_gain"]),
+            format_calibration_value("start_raw", self.saved["start_raw"]),
+            format_calibration_value("full_raw", self.saved["full_raw"]),
+            format_calibration_value("tow_left_comp", current["tow_left_comp"]),
+            format_calibration_value("tow_right_comp", current["tow_right_comp"]),
         )
 
 
@@ -1276,7 +1288,17 @@ class CartController:
         self.tared = True
         self.sensor_ok = True
         self.sensor_error = ""
-        self.hardware_log.event("tare_ok")
+        self.tow_armed = False
+        self.tow_left_baseline = 0.0
+        self.tow_right_baseline = 0.0
+        self.tow_left_force = 0.0
+        self.tow_right_force = 0.0
+        self.hardware_log.event(
+            "tare_ok",
+            "l={} r={} start_raw={} full_raw={}".format(
+                left_offset, right_offset, PULL_START_RAW, PULL_FULL_RAW
+            ),
+        )
         print("tare_left={}, tare_right={}".format(left_offset, right_offset))
         return True
 
@@ -1599,14 +1621,15 @@ class CartController:
 
     def status_line(self):
         return (
-            "stat mode={} sensor={} err={} lraw={:.0f} rraw={:.0f} l={:.0f} r={:.0f} "
+            "stat mode={} sensor={} tared={} err={} lraw={:.0f} rraw={:.0f} l={:.0f} r={:.0f} "
             "ltow={:.0f} rtow={:.0f} lbase={:.0f} rbase={:.0f} "
             "total={:.0f} steer={:.2f} targetl={:.2f} targetr={:.2f} "
             "pwml={:.2f} pwmr={:.2f} age_ms={} estop={} front={} front_signal={} "
-            "bt={} unsafe={} drive={} loop_ms={}"
+            "bt={} unsafe={} drive={} loop_ms={} start_raw={} full_raw={}"
         ).format(
             self.mode,
             "ok" if self.sensor_ok else "bad",
+            bool_text(self.tared),
             self.sensor_error or "-",
             self.left_filtered,
             self.right_filtered,
@@ -1630,6 +1653,8 @@ class CartController:
             self.unsafe_reason or "-",
             self.drive_status,
             self.last_loop_ms,
+            PULL_START_RAW,
+            PULL_FULL_RAW,
         )
 
     def param_line(self):
@@ -1920,10 +1945,15 @@ class CommandInterface:
                 return
             self.controller.hardware_log.event("cal_save", "group={}".format(group))
             self.reply(
-                "ok cal_save group={} left_motor_gain={} right_motor_gain={}".format(
+                "ok cal_save group={} left_motor_gain={} right_motor_gain={} "
+                "left_force_gain={} right_force_gain={} start_raw={} full_raw={}".format(
                     group,
                     format_calibration_value("left_motor_gain", saved["left_motor_gain"]),
                     format_calibration_value("right_motor_gain", saved["right_motor_gain"]),
+                    format_calibration_value("left_force_gain", saved["left_force_gain"]),
+                    format_calibration_value("right_force_gain", saved["right_force_gain"]),
+                    format_calibration_value("start_raw", saved["start_raw"]),
+                    format_calibration_value("full_raw", saved["full_raw"]),
                 )
             )
             self.reply(store.status_line())
@@ -2005,9 +2035,9 @@ class CommandInterface:
                 else:
                     self.reply("err usage: stream on|off")
             elif command == "auto" or command == "tow":
-                if not self.controller.sensor_ok:
+                if not self.controller.tared or not self.controller.sensor_ok:
                     self.controller.stop(MODE_IDLE)
-                    self.reply("err sensor_not_ready")
+                    self.reply("err sensor_not_ready err={}".format(self.controller.sensor_error or "not_tared"))
                 elif not self.controller.enter_tow():
                     self.reply("err front_obstacle")
                 else:
@@ -2037,7 +2067,21 @@ class CommandInterface:
             elif command == "tare":
                 ok = self.controller.tare_sensors()
                 self.controller.stop(MODE_IDLE)
-                self.reply("ok tare" if ok else "err {}".format(self.controller.sensor_error))
+                if ok:
+                    self.reply(
+                        "ok tare tared=1 sensor=ok lraw={:.0f} rraw={:.0f} l={:.0f} r={:.0f} start_raw={} full_raw={}".format(
+                            self.controller.left_filtered,
+                            self.controller.right_filtered,
+                            self.controller.left_force,
+                            self.controller.right_force,
+                            PULL_START_RAW,
+                            PULL_FULL_RAW,
+                        )
+                    )
+                else:
+                    self.reply(
+                        "err tare tared=0 sensor=bad err={}".format(self.controller.sensor_error or "tare_failed")
+                    )
             elif command == "drive":
                 if not ALLOW_BLE_MANUAL_DRIVE:
                     self.reply("err manual_disabled")
@@ -2179,11 +2223,10 @@ def main():
             hardware_log.event("cal_default", "reason={}".format(err))
             print("cal_default reason={}".format(err))
 
-    print("Keep both load cells unloaded. Taring...")
+    print("Keep both load cells unloaded. Long-term calibration loaded; tare is required after every boot.")
     led_mode.pulse(2000)
-    controller.tare_sensors()
     controller.stop(MODE_IDLE, "boot_ready")
-    hardware_log.event("boot", "proto={}".format(PROTOCOL_VERSION))
+    hardware_log.event("boot", "proto={} tared=0".format(PROTOCOL_VERSION))
     print(
         "ble_commands: help pins status identify stream on|off tow auto manual stop softstop keepalive tare drive L R f b l r motor set"
     )

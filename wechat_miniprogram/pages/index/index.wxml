@@ -150,7 +150,24 @@
       <button class="mini-button" bindtap="testLeftWheel">试左轮</button>
       <button class="mini-button" bindtap="testRightWheel">试右轮</button>
       <button class="mini-button" bindtap="testStraight">短距直行</button>
-      <button class="mini-button primary" bindtap="saveMotorCalibration" loading="{{calSaving}}" disabled="{{calSaving}}">停车并保存</button>
+      <button class="mini-button primary" bindtap="saveMotorCalibration" loading="{{calSaving}}" disabled="{{calSaving}}">停车并保存轮速</button>
+    </view>
+  </view>
+
+  <view wx:if="{{connected}}" class="section">
+    <view class="section-head">
+      <text>拉力校准</text>
+      <button class="mini-button" bindtap="refreshCalibration">刷新</button>
+    </view>
+    <view class="muted diagnostic-note">读数是相对原始量，不是公斤。先停车卸载，再归零。当前 左 {{status.lraw}} / {{status.l}}，右 {{status.rraw}} / {{status.r}}。</view>
+    <view wx:if="{{status.tared == 1}}" class="muted diagnostic-note">已归零：是。牵引前仍需确认两路卸载。</view>
+    <view wx:else class="muted diagnostic-note">已归零：否。上电或失败后必须重新卸载归零。</view>
+    <view class="muted diagnostic-note">已保存增益 左 {{savedLeftForceGain}} / 右 {{savedRightForceGain}}，阈值 {{savedStartRaw}} / {{savedFullRaw}}。牵引补偿不要和增益同时加大。</view>
+    <view class="diagnostic-note">{{tareStatus}}</view>
+    <view class="diagnostic-note">{{calStatus}}</view>
+    <view class="log-actions">
+      <button class="mini-button" bindtap="sendTare">卸载归零</button>
+      <button class="mini-button primary" bindtap="saveForceCalibration" loading="{{calSaving}}" disabled="{{calSaving}}">停车并保存拉力</button>
     </view>
   </view>
 

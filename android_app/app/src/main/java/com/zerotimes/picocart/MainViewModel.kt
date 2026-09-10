@@ -105,6 +105,11 @@ data class CartUiState(
     val calibrationSaving: Boolean = false,
     val savedLeftMotorGain: String = "-",
     val savedRightMotorGain: String = "-",
+    val savedLeftForceGain: String = "-",
+    val savedRightForceGain: String = "-",
+    val savedStartRaw: String = "-",
+    val savedFullRaw: String = "-",
+    val tareStatus: String = "上电后需重新归零，上次零点不会自动恢复",
     val gamepadState: GamepadState = GamepadState(),
 ) {
     val cartReady: Boolean
@@ -117,6 +122,7 @@ data class CartUiState(
         val defaultStatus = linkedMapOf(
             "mode" to "-",
             "sensor" to "-",
+            "tared" to "0",
             "err" to "-",
             "lraw" to "0",
             "rraw" to "0",
@@ -449,6 +455,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun testRightWheel() = sendCommand("motor right f 0.16 800")
 
     fun testStraight() = sendCommand("f 0.16")
+
+    fun saveForceCalibration() {
+        if (_uiState.value.calibrationSaving) return
+        if (!sendCommand("stop")) return
+        if (!sendCommand("cal save force")) return
+        _uiState.update { it.copy(calibrationSaving = true, calibrationStatus = "正在停车并保存拉力增益和阈值") }
+    }
 
     fun updateCustomCommand(value: String) {
         _uiState.update { it.copy(customCommand = value) }
@@ -909,6 +922,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (parsed.type == "err" && line.contains("cal")) {
             _uiState.update { it.copy(calibrationSaving = false, calibrationStatus = "保存失败：$line") }
         }
+        if (parsed.type == "err" && (line.contains("tare") || parsed["err"] == "not_tared" || line.contains("sensor_not_ready"))) {
+            _uiState.update { it.copy(tareStatus = "归零或牵引失败：$line") }
+        }
         if (parsed.type != "stat") {
             addLog("< $line")
         }
@@ -935,13 +951,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     _uiState.update { it.copy(streaming = stream == "on") }
                 }
                 if (line.startsWith("ok cal_save ")) {
+                    val group = parsed["group"].orEmpty()
                     _uiState.update {
                         it.copy(
                             calibrationSaving = false,
-                            calibrationStatus = "已保存左右轮增益 ${parsed["left_motor_gain"] ?: "-"} / ${parsed["right_motor_gain"] ?: "-"}",
+                            calibrationStatus = when (group) {
+                                "force" -> "已保存拉力增益 ${parsed["left_force_gain"] ?: "-"} / ${parsed["right_force_gain"] ?: "-"}，阈值 ${parsed["start_raw"] ?: "-"} / ${parsed["full_raw"] ?: "-"}"
+                                "motor" -> "已保存左右轮增益 ${parsed["left_motor_gain"] ?: "-"} / ${parsed["right_motor_gain"] ?: "-"}"
+                                else -> "已保存校准分组 $group"
+                            },
                             savedLeftMotorGain = parsed["left_motor_gain"] ?: it.savedLeftMotorGain,
                             savedRightMotorGain = parsed["right_motor_gain"] ?: it.savedRightMotorGain,
+                            savedLeftForceGain = parsed["left_force_gain"] ?: it.savedLeftForceGain,
+                            savedRightForceGain = parsed["right_force_gain"] ?: it.savedRightForceGain,
+                            savedStartRaw = parsed["start_raw"] ?: it.savedStartRaw,
+                            savedFullRaw = parsed["full_raw"] ?: it.savedFullRaw,
                         )
+                    }
+                }
+                if (line.startsWith("ok tare")) {
+                    _uiState.update {
+                        it.copy(tareStatus = "归零成功。零点读数左 ${parsed["lraw"] ?: parsed["l"] ?: "0"} / 右 ${parsed["rraw"] ?: parsed["r"] ?: "0"}，需低于启动阈值。")
                     }
                 }
             }
@@ -955,6 +985,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     },
                     savedLeftMotorGain = parsed["saved_left_motor_gain"] ?: it.savedLeftMotorGain,
                     savedRightMotorGain = parsed["saved_right_motor_gain"] ?: it.savedRightMotorGain,
+                    savedLeftForceGain = parsed["saved_left_force_gain"] ?: it.savedLeftForceGain,
+                    savedRightForceGain = parsed["saved_right_force_gain"] ?: it.savedRightForceGain,
+                    savedStartRaw = parsed["saved_start_raw"] ?: it.savedStartRaw,
+                    savedFullRaw = parsed["saved_full_raw"] ?: it.savedFullRaw,
                 )
             }
         }

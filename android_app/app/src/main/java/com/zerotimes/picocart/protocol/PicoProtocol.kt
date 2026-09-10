@@ -67,10 +67,14 @@ object PicoProtocol {
         "decel_ramp" -> "停车斜坡（每 25ms PWM 减量）"
         "timeout_ms" -> "手动控制保活超时（毫秒）"
         "reverse_neutral_ms" -> "反向零位等待（毫秒）"
-        "tow_left_comp" -> "牵引左通道补偿（原始拉力）"
-        "tow_right_comp" -> "牵引右通道补偿（原始拉力）"
         "left_motor_gain" -> "左轮增益"
         "right_motor_gain" -> "右轮增益"
+        "left_force_gain" -> "左拉力增益"
+        "right_force_gain" -> "右拉力增益"
+        "start_raw" -> "启动拉力阈值"
+        "full_raw" -> "满功率拉力阈值"
+        "tow_left_comp" -> "牵引左通道补偿（原始量，勿与增益重复叠加）"
+        "tow_right_comp" -> "牵引右通道补偿（原始量，勿与增益重复叠加）"
         else -> key
     }
 

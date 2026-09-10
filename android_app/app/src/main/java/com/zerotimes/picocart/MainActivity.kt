@@ -294,6 +294,7 @@ private fun PicoCartApp(
         onApplyParam = viewModel::applyParam,
         onRefreshCalibration = viewModel::refreshCalibration,
         onSaveMotorCalibration = viewModel::saveMotorCalibration,
+        onSaveForceCalibration = viewModel::saveForceCalibration,
         onTestLeftWheel = viewModel::testLeftWheel,
         onTestRightWheel = viewModel::testRightWheel,
         onTestStraight = viewModel::testStraight,
@@ -365,6 +366,7 @@ private fun PicoCartScreen(
     onApplyParam: (String) -> Unit,
     onRefreshCalibration: () -> Unit,
     onSaveMotorCalibration: () -> Unit,
+    onSaveForceCalibration: () -> Unit,
     onTestLeftWheel: () -> Unit,
     onTestRightWheel: () -> Unit,
     onTestStraight: () -> Unit,
@@ -579,6 +581,14 @@ private fun PicoCartScreen(
                                 onTestLeftWheel = onTestLeftWheel,
                                 onTestRightWheel = onTestRightWheel,
                                 onTestStraight = onTestStraight,
+                                onParamInput = onParamInput,
+                                onApplyParam = onApplyParam,
+                            )
+                            ForceCalibrationSection(
+                                state = state,
+                                onRefreshCalibration = onRefreshCalibration,
+                                onTare = onTare,
+                                onSaveForceCalibration = onSaveForceCalibration,
                                 onParamInput = onParamInput,
                                 onApplyParam = onApplyParam,
                             )
@@ -2231,6 +2241,60 @@ private fun WheelCalibrationSection(
         }
         Spacer(Modifier.height(8.dp))
         listOf("left_motor_gain", "right_motor_gain").forEach { key ->
+            OutlinedTextField(
+                value = state.paramInputs[key].orEmpty(),
+                onValueChange = { onParamInput(key, it) },
+                label = { Text(PicoProtocol.parameterLabel(key)) },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                trailingIcon = {
+                    TextButton(onClick = { onApplyParam(key) }, enabled = state.cartReady) { Text("写入") }
+                },
+            )
+            Spacer(Modifier.height(8.dp))
+        }
+    }
+}
+
+@Composable
+private fun ForceCalibrationSection(
+    state: CartUiState,
+    onRefreshCalibration: () -> Unit,
+    onTare: () -> Unit,
+    onSaveForceCalibration: () -> Unit,
+    onParamInput: (String, String) -> Unit,
+    onApplyParam: (String) -> Unit,
+) {
+    val tared = state.status["tared"] == "1"
+    val leftRaw = state.status["lraw"] ?: "0"
+    val rightRaw = state.status["rraw"] ?: "0"
+    val leftForce = state.status["l"] ?: "0"
+    val rightForce = state.status["r"] ?: "0"
+    val startRaw = state.paramInputs["start_raw"] ?: state.status["start_raw"] ?: "-"
+    val fullRaw = state.paramInputs["full_raw"] ?: state.status["full_raw"] ?: "-"
+    Section(title = "拉力校准") {
+        Text("读数是相对原始量，不是公斤或牛顿。先停车并让两路完全卸载，再归零。牵引补偿与增益不要同时加大。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.height(8.dp))
+        Text("传感器：${state.status["sensor"] ?: "-"}，已归零：${if (tared) "是" else "否"}，错误：${state.status["err"] ?: "-"}",
+            style = MaterialTheme.typography.bodySmall)
+        Text("当前读数 左 $leftRaw / $leftForce，右 $rightRaw / $rightForce。启动/满功率阈值 $startRaw / $fullRaw。",
+            style = MaterialTheme.typography.bodySmall)
+        Text("已保存增益：左 ${state.savedLeftForceGain} / 右 ${state.savedRightForceGain}，阈值 ${state.savedStartRaw} / ${state.savedFullRaw}",
+            style = MaterialTheme.typography.bodySmall)
+        Text(state.tareStatus, style = MaterialTheme.typography.bodySmall)
+        Text(state.calibrationStatus, style = MaterialTheme.typography.bodySmall)
+        Spacer(Modifier.height(8.dp))
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            ActionButton("刷新校准", Icons.Filled.Refresh, onRefreshCalibration, enabled = state.cartReady)
+            ActionButton("卸载归零", Icons.Filled.Refresh, onTare, enabled = state.cartReady)
+            ActionButton(if (state.calibrationSaving) "保存中" else "停车并保存拉力", Icons.Filled.Save,
+                onSaveForceCalibration, enabled = state.cartReady && !state.calibrationSaving)
+        }
+        Spacer(Modifier.height(8.dp))
+        listOf("left_force_gain", "right_force_gain", "start_raw", "full_raw").forEach { key ->
             OutlinedTextField(
                 value = state.paramInputs[key].orEmpty(),
                 onValueChange = { onParamInput(key, it) },

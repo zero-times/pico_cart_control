@@ -1,6 +1,6 @@
 # Pico 校准参数保存
 
-本指南对应固件 `0.2.2`。轮速校准和后续拉力校准共用一份配置，不写两套文件。
+本指南对应固件 `0.2.3`。轮速校准和后续拉力校准共用一份配置，不写两套文件。
 参数修改与保存分开：`set` 只改当前运行值，`cal save` 才写入 Flash。保存必须在停车后进行。
 
 ## 文件与字段
@@ -10,7 +10,7 @@ Pico 使用 `pico_cart_cal.cfg`，先写临时文件再改名，避免半份配�
 | 分组 | 字段 | 范围 | 本任务 |
 |---|---|---|---|
 | motor | `left_motor_gain` / `right_motor_gain` | 0.50–1.20 | 保存轮速左右增益 |
-| force | `left_force_gain` / `right_force_gain` / `start_raw` / `full_raw` / `tow_left_comp` / `tow_right_comp` | 固件限幅，且 `full_raw > start_raw` | 留给 PICOCART-3，本任务只预留字段 |
+| force | `left_force_gain` / `right_force_gain` / `start_raw` / `full_raw` / `tow_left_comp` / `tow_right_comp` | 固件限幅，且 `full_raw > start_raw` | 拉力校准保存这些字段，不覆盖 motor |
 
 缺失、损坏或非法配置会回退到固件默认值，小车保持 `idle`，不会自动开始运动。保存 `motor` 不会重置 `force`，反之亦然。
 
@@ -22,6 +22,7 @@ cal status
 set left_motor_gain 0.95
 set right_motor_gain 1.05
 cal save motor
+cal save force
 ```
 
 `cal status` 回包区分当前值和已保存值。`dirty=1` 表示还有未保存改动。行驶中保存会返回 `err cal_not_idle`。

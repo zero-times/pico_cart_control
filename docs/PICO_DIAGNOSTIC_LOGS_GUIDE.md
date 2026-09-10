@@ -1,6 +1,6 @@
 # Pico 诊断日志：采集、时间同步与验收
 
-本指南对应固件 `0.2.2`。手机继续通过 BLE 控制小车；USB 用于 Pico 调试和日志读取。
+本指南对应固件 `0.2.3`。手机继续通过 BLE 控制小车；USB 用于 Pico 调试和日志读取。
 诊断的目标是关联手机命令、蓝牙链路、传感器与停车事件，同时让导出与清理的结果可核验。
 
 ## 接口与存储范围
@@ -33,7 +33,7 @@ time sync <UnixMillis>
 也允许用户主动重新同步时间。设备时间查询和同步回包使用相同格式：
 
 ```text
-time synced=1 unix_ms=<UnixMillis> uptime_ms=<UptimeMillis> fw=0.2.2
+time synced=1 unix_ms=<UnixMillis> uptime_ms=<UptimeMillis> fw=0.2.3
 ```
 
 日志中的字段含义如下：
@@ -91,15 +91,15 @@ time synced=1 unix_ms=<UnixMillis> uptime_ms=<UptimeMillis> fw=0.2.2
 容量回包：
 
 ```text
-ok hwlog_status n=<Count> cap=192 used_pct=<IntegerPercent> overwritten=<Count> exporting=<0or1> fw=0.2.2 synced=<0or1>
+ok hwlog_status n=<Count> cap=192 used_pct=<IntegerPercent> overwritten=<Count> exporting=<0or1> fw=0.2.3 synced=<0or1>
 ```
 
 一次导出的开始、记录与结束：
 
 ```text
-ok hwlog_export n=<Total> x=<ExportId> last=<LastSequence> fw=0.2.2
-hwlog x=<ExportId> i=<Index> n=<Total> s=<Sequence> t=<UptimeMillis> u=<UnixMillisOrZero> fw=0.2.2 e=<Event> ...
-hwlog_end n=<Total> x=<ExportId> last=<LastSequence> fw=0.2.2
+ok hwlog_export n=<Total> x=<ExportId> last=<LastSequence> fw=0.2.3
+hwlog x=<ExportId> i=<Index> n=<Total> s=<Sequence> t=<UptimeMillis> u=<UnixMillisOrZero> fw=0.2.3 e=<Event> ...
+hwlog_end n=<Total> x=<ExportId> last=<LastSequence> fw=0.2.3
 ```
 
 `i` 是本次导出的 1 基索引，必须完整覆盖 `1..n`，重复索引不得增加接收总数。
@@ -171,7 +171,7 @@ adb pull /sdcard/Android/data/com.zerotimes.picocart/files/logs ./pico-cart-logs
 adb pull /sdcard/Android/data/com.zerotimes.picocart/files/logs/pico_cart_debug.log ./pico_cart_debug.log
 ```
 
-在文件中定位 `[hardware]`、`fw=0.2.2` 和相应导出 ID；用 `s`、`t`、`u` 关联手机发送记录与
+在文件中定位 `[hardware]`、`fw=0.2.3` 和相应导出 ID；用 `s`、`t`、`u` 关联手机发送记录与
 Pico 事件。手机日志行前的日期是手机落盘时间，Pico `u` 才是校时后的事件时间，二者不应混用。
 如文件中只有请求记录而没有硬件日志，先检查导出是否完成、Pico 固件是否匹配、BLE 心跳是否正常。
 
