@@ -59,7 +59,8 @@ GP16 -> 急停开关 -> GND
 不要把模块的 `5V OUT` 直接接入 Pico。程序在 `GP22` 下降沿出现时立即
 硬停电机，并在信号连续恢复 400ms 后解除障碍锁。障碍触发会清除原来的
 前进目标，禁止前进和原地转向；仍可重新发送后退命令脱困。牵引模式触发
-后必须先松开牵引绳重新解锁，不会在障碍消失后自动继续前进。
+后必须先松开牵引绳重新解锁，不会在障碍消失后自动继续前进。障碍和急停只会停车，
+不会退出牵引模式；蓝牙断开或重连也不会退出。
 
 状态日志中：
 
@@ -202,6 +203,7 @@ set left_motor_gain 1.00
 set right_motor_gain 0.90
 set left_force_gain 1.00
 set right_force_gain 1.00
+set tow_idle_ms 300000
 ```
 
 `drive/f/b/l/r` 是手动电机测试命令，程序限制为 `MANUAL_MAX_PWM = 0.25`，并且 `700ms` 内没有新命令就自动停。
@@ -234,13 +236,13 @@ identify 5：快闪 5 秒，然后自动回到上述状态
 
 ```text
 info proto=pico-cart-ble-2026-07-04 uart=UART0 tx=GP0 rx=GP1 state=GP15 right_inb=GP17 auto_start=0
-param max_pwm=0.45 min_pwm=0.14 start_raw=25000 full_raw=180000 steer_gain=0.75 ramp=0.018 manual_max=0.25 timeout_ms=1200
+param max_pwm=0.45 min_pwm=0.14 start_raw=25000 full_raw=180000 steer_gain=0.75 ramp=0.018 manual_max=0.25 timeout_ms=1200 tow_idle_ms=300000
 stat mode=idle sensor=ok err=- lraw=0 rraw=0 l=0 r=0 total=0 steer=0.00 pwml=0.00 pwmr=0.00 estop=1 bt=1 unsafe=-
 ok stop
 err unknown_cmd
 ```
 
-新版程序上电默认是 `idle`，不会自动进入拉力助力；蓝牙连接、传感器 `tare`、重启后都不会自动转动。只有在小程序或串口里明确发 `auto` 后，才进入自动牵引模式。
+新版程序上电默认是 `idle`，不会自动进入拉力助力；蓝牙连接、传感器 `tare`、重启后都不会自动转动。只有在小程序或 App 里明确发 `auto`/`tow` 后，才进入自动牵引模式。进入后只有三种情况会退出：连续 `tow_idle_ms`（默认 5 分钟）没有拉力输入、手机主动发 `idle`/`stop`/`manual`/`tare` 等切模式命令，或断电。蓝牙断开、重连、前方障碍和急停都不会退出牵引模式。
 
 ## 微信小程序调试端
 

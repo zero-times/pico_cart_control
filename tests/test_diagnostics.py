@@ -280,6 +280,81 @@ class DiagnosticsTests(unittest.TestCase):
         controller.left_motor.stop.assert_called()
         controller.right_motor.stop.assert_called()
 
+    def make_controller(self):
+        controller = fw.CartController(
+            Mock(),
+            Mock(),
+            Mock(current=0.0),
+            Mock(current=0.0),
+            Mock(),
+            Mock(blocked=False),
+            Mock(),
+            fw.HardwareLogger(),
+        )
+        controller.estop.value.return_value = 1
+        controller.front_obstacle.signal_active.return_value = False
+        controller.front_obstacle.update = Mock()
+        controller.ble.connected.return_value = 1
+        controller.left_motor.ramp_to = Mock()
+        controller.right_motor.ramp_to = Mock()
+        controller.left_motor.stop = Mock()
+        controller.right_motor.stop = Mock()
+        controller.tared = True
+        controller.sensor_ok = True
+        controller.sensor_error = ""
+        return controller
+
+    def test_ble_disconnect_keeps_tow_and_stops_manual(self):
+        controller = self.make_controller()
+        controller.mode = fw.MODE_AUTO
+        controller.tow_armed = True
+        controller.drive_status = "active"
+        controller.handle_ble_connection(False)
+        self.assertEqual(controller.mode, fw.MODE_AUTO)
+        controller.left_motor.stop.assert_not_called()
+        controller.mode = fw.MODE_MANUAL
+        controller.motor_test_running = False
+        controller.handle_ble_connection(False)
+        self.assertEqual(controller.mode, fw.MODE_IDLE)
+        controller.left_motor.stop.assert_called()
+        controller.right_motor.stop.assert_called()
+
+    def test_tow_idle_timeout_exits_only_without_pull(self):
+        global now
+        now = 1000
+        previous_timeout = fw.TOW_IDLE_TIMEOUT_MS
+        fw.TOW_IDLE_TIMEOUT_MS = 10000
+        self.addCleanup(lambda: setattr(fw, "TOW_IDLE_TIMEOUT_MS", previous_timeout))
+        controller = self.make_controller()
+        controller.enter_tow()
+        self.assertEqual(controller.mode, fw.MODE_AUTO)
+        controller.tow_armed = True
+        controller.tow_left_force = 0.0
+        controller.tow_right_force = 0.0
+        now += 9999
+        self.assertFalse(controller.apply_tow_idle_timeout(now))
+        self.assertEqual(controller.mode, fw.MODE_AUTO)
+        controller.tow_left_force = 4000
+        now += 10000
+        self.assertFalse(controller.apply_tow_idle_timeout(now))
+        self.assertEqual(controller.mode, fw.MODE_AUTO)
+        controller.tow_left_force = 0.0
+        now += 10001
+        self.assertTrue(controller.apply_tow_idle_timeout(now))
+        self.assertEqual(controller.mode, fw.MODE_IDLE)
+
+    def test_set_tow_idle_ms_is_reported_in_params(self):
+        previous_timeout = fw.TOW_IDLE_TIMEOUT_MS
+        fw.TOW_IDLE_TIMEOUT_MS = 300000
+        self.addCleanup(lambda: setattr(fw, "TOW_IDLE_TIMEOUT_MS", previous_timeout))
+        interface, _log = self.make_interface()
+        interface.controller.param_line.return_value = "param tow_idle_ms=180000"
+        interface.handle("set tow_idle_ms 180000")
+        self.assertEqual(fw.TOW_IDLE_TIMEOUT_MS, 180000)
+        replies = [call.args[0] for call in interface.ble.write.call_args_list]
+        self.assertTrue(any(text.startswith("ok set tow_idle_ms=180000") for text in replies))
+        self.assertEqual(replies[-1], "param tow_idle_ms=180000")
+
     def test_calibration_save_keeps_other_group_and_rejects_motion(self):
         store = fw.CalibrationStore(path="_cal_test.cfg", temp_path="_cal_test.cfg.tmp")
         motor = fw.apply_calibration_values({"left_motor_gain": 0.9, "right_motor_gain": 1.1})

@@ -40,8 +40,8 @@ BLE_STATE_ACTIVE_HIGH = True
 BLE_LINE_MAX = 160
 # Ignore STATE pin glitches; a real drop still stops well before timeout_ms.
 BLE_STATE_DEBOUNCE_MS = 80
-PROTOCOL_VERSION = "pico-cart-ble-2026-09-10-force"
-FIRMWARE_VERSION = "0.2.3"
+PROTOCOL_VERSION = "pico-cart-ble-2026-09-10-tow-idle"
+FIRMWARE_VERSION = "0.2.4"
 
 # HX711 modules. Each S-type load cell uses one HX711.
 LEFT_HX711_DOUT = 6
@@ -149,6 +149,11 @@ MANUAL_MAX_PWM = 0.25
 MANUAL_TIMEOUT_MS = 1200
 REVERSE_NEUTRAL_MS = 120
 MOTOR_ZERO_EPSILON = 0.002
+# Tow mode stays active across BLE drops. Exit only on this idle timeout,
+# an explicit phone/app mode change, or power loss. Default 5 minutes.
+TOW_IDLE_TIMEOUT_MS = 300000
+TOW_IDLE_TIMEOUT_MIN_MS = 10000
+TOW_IDLE_TIMEOUT_MAX_MS = 1800000
 
 # Keep the obstacle latched until the signal has remained clear for this long.
 FRONT_OBSTACLE_CLEAR_MS = 400
@@ -1163,6 +1168,7 @@ class CartController:
         self.pending_manual_left = 0.0
         self.pending_manual_right = 0.0
         self.last_manual_ms = ticks_ms()
+        self.last_tow_input_ms = ticks_ms()
         self.drive_status = "idle"
         self.reverse_state = ""
         self.reverse_neutral_started_ms = 0
@@ -1233,6 +1239,7 @@ class CartController:
         self.tow_armed = False
         self.tow_left_force = 0.0
         self.tow_right_force = 0.0
+        self.last_tow_input_ms = ticks_ms()
         self.clear_motor_test()
         self.left_motor.stop()
         self.right_motor.stop()
@@ -1445,6 +1452,7 @@ class CartController:
         self.tow_left_force = 0.0
         self.tow_right_force = 0.0
         self.drive_status = "calibrating"
+        self.last_tow_input_ms = ticks_ms()
         self.left_motor.stop()
         self.right_motor.stop()
         self.clear_motor_test()
@@ -1458,6 +1466,35 @@ class CartController:
         self.tow_right_force = max(
             0.0, self.right_force - self.tow_right_baseline - TOW_RIGHT_COMP_RAW
         )
+
+    def tow_input_active(self):
+        if not self.sensor_ok:
+            return False
+        return (
+            self.tow_left_force >= TOW_MIN_VALID_PULL_RAW
+            or self.tow_right_force >= TOW_MIN_VALID_PULL_RAW
+            or (self.tow_left_force + self.tow_right_force) >= PULL_START_RAW
+        )
+
+    def apply_tow_idle_timeout(self, now):
+        if self.mode != MODE_AUTO:
+            return False
+        if self.tow_input_active():
+            self.last_tow_input_ms = now
+            return False
+        if ticks_diff(now, self.last_tow_input_ms) > TOW_IDLE_TIMEOUT_MS:
+            self.stop(MODE_IDLE, "tow_idle_timeout")
+            return True
+        return False
+
+    def handle_ble_connection(self, connected):
+        # Manual drive and motor tests require a live phone link. Tow mode is
+        # unlocked by the app and must keep running across disconnect/reconnect.
+        if self.mode == MODE_MANUAL or self.motor_test_running:
+            self.stop(
+                MODE_IDLE,
+                "ble_connect_reset" if connected else "ble_disconnect",
+            )
 
     def observe_hardware(self, now):
         self.hardware_log.observe(self, now)
@@ -1482,6 +1519,11 @@ class CartController:
             self.drive_status = "idle"
             self.left_motor.ramp_to(0.0, now)
             self.right_motor.ramp_to(0.0, now)
+            if self.mode == MODE_AUTO:
+                self.update_tow_forces()
+            if self.apply_tow_idle_timeout(now):
+                self.observe_hardware(now)
+                return
             self.observe_hardware(now)
             return
 
@@ -1493,11 +1535,15 @@ class CartController:
 
         if self.mode == MODE_AUTO and self.front_obstacle.blocked:
             self.tow_armed = False
-            self.total = self.left_force + self.right_force
+            self.update_tow_forces()
+            self.total = self.tow_left_force + self.tow_right_force
             self.steer = 0.0
             self.drive_status = "front_obstacle"
             self.left_motor.stop()
             self.right_motor.stop()
+            if self.apply_tow_idle_timeout(now):
+                self.observe_hardware(now)
+                return
             self.observe_hardware(now)
             return
 
@@ -1603,6 +1649,10 @@ class CartController:
                     self.steer = 0.0
                     self.drive_status = "idle"
 
+            if self.apply_tow_idle_timeout(now):
+                self.observe_hardware(now)
+                return
+
         left_target *= LEFT_MOTOR_GAIN
         right_target *= RIGHT_MOTOR_GAIN
         if self.front_blocks_targets(left_target, right_target):
@@ -1625,7 +1675,8 @@ class CartController:
             "ltow={:.0f} rtow={:.0f} lbase={:.0f} rbase={:.0f} "
             "total={:.0f} steer={:.2f} targetl={:.2f} targetr={:.2f} "
             "pwml={:.2f} pwmr={:.2f} age_ms={} estop={} front={} front_signal={} "
-            "bt={} unsafe={} drive={} loop_ms={} start_raw={} full_raw={}"
+            "bt={} unsafe={} drive={} loop_ms={} start_raw={} full_raw={} "
+            "tow_idle_ms={} tow_age_ms={}"
         ).format(
             self.mode,
             "ok" if self.sensor_ok else "bad",
@@ -1655,13 +1706,15 @@ class CartController:
             self.last_loop_ms,
             PULL_START_RAW,
             PULL_FULL_RAW,
+            TOW_IDLE_TIMEOUT_MS,
+            max(0, ticks_diff(ticks_ms(), self.last_tow_input_ms)) if self.mode == MODE_AUTO else 0,
         )
 
     def param_line(self):
         return (
             "param max_pwm={:.2f} min_pwm={:.2f} start_raw={} full_raw={} "
             "steer_gain={:.2f} ramp={:.3f} decel_ramp={:.3f} manual_max={:.2f} "
-            "timeout_ms={} reverse_neutral_ms={} "
+            "timeout_ms={} reverse_neutral_ms={} tow_idle_ms={} "
             "left_motor_gain={:.2f} right_motor_gain={:.2f} "
             "left_force_gain={:.2f} right_force_gain={:.2f} "
             "tow_left_comp={} tow_right_comp={} "
@@ -1677,6 +1730,7 @@ class CartController:
             MANUAL_MAX_PWM,
             MANUAL_TIMEOUT_MS,
             REVERSE_NEUTRAL_MS,
+            TOW_IDLE_TIMEOUT_MS,
             LEFT_MOTOR_GAIN,
             RIGHT_MOTOR_GAIN,
             LEFT_FORCE_GAIN,
@@ -1788,7 +1842,7 @@ class CommandInterface:
             "help cmd: ver info pins status param cal status|save [motor|force] time sync MS|status stream on|off hwlog dump|clear [SEQ]|status identify [S] tow auto manual idle stop softstop keepalive tare drive L R f [P] b [P] l [P] r [P] motor SIDE DIR [P] [MS] set NAME VALUE"
         )
         self.reply(
-            "help set: max_pwm min_pwm start_raw full_raw steer_gain ramp decel_ramp manual_max timeout_ms reverse_neutral_ms left_motor_gain right_motor_gain left_force_gain right_force_gain tow_left_comp tow_right_comp"
+            "help set: max_pwm min_pwm start_raw full_raw steer_gain ramp decel_ramp manual_max timeout_ms reverse_neutral_ms tow_idle_ms left_motor_gain right_motor_gain left_force_gain right_force_gain tow_left_comp tow_right_comp"
         )
 
     def pins_line(self):
@@ -1860,6 +1914,7 @@ class CommandInterface:
     def handle_set(self, parts):
         global MAX_PWM, MIN_MOVE_PWM, STEER_GAIN, RAMP_STEP, DECEL_RAMP_STEP
         global MANUAL_MAX_PWM, MANUAL_TIMEOUT_MS, REVERSE_NEUTRAL_MS
+        global TOW_IDLE_TIMEOUT_MS
 
         if len(parts) != 3:
             self.reply("err usage: set NAME VALUE")
@@ -1907,6 +1962,9 @@ class CommandInterface:
         elif name == "reverse_neutral_ms":
             REVERSE_NEUTRAL_MS = int(clamp(value, 50, 1000))
             stored = REVERSE_NEUTRAL_MS
+        elif name == "tow_idle_ms":
+            TOW_IDLE_TIMEOUT_MS = int(clamp(value, TOW_IDLE_TIMEOUT_MIN_MS, TOW_IDLE_TIMEOUT_MAX_MS))
+            stored = TOW_IDLE_TIMEOUT_MS
         else:
             self.reply("err unknown_set_name")
             return
@@ -2245,8 +2303,7 @@ def main():
             if connection_event == 1:
                 ble.reset_connection_buffers()
                 hardware_log.event("ble_connect", "state=1 cause=unknown")
-                if controller.mode in (MODE_AUTO, MODE_MANUAL) or controller.motor_test_running:
-                    controller.stop(MODE_IDLE, "ble_connect_reset")
+                controller.handle_ble_connection(True)
                 commands.send_hello()
             elif connection_event == 0:
                 ble.reset_connection_buffers()
@@ -2254,8 +2311,7 @@ def main():
                     hardware_log.cancel_export()
                     hardware_log.event("hwlog_interrupted", "reason=ble_disconnect")
                 hardware_log.event("ble_disconnect", "state=0 cause=unknown")
-                if controller.mode in (MODE_MANUAL, MODE_AUTO) or controller.motor_test_running:
-                    controller.stop(MODE_IDLE, "ble_disconnect")
+                controller.handle_ble_connection(False)
 
             for line in ble.poll_lines():
                 commands.handle(line)

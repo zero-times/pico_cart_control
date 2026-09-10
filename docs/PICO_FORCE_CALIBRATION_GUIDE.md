@@ -1,6 +1,6 @@
 # Pico 拉力校准
 
-本指南对应固件 `0.2.3`。拉力校准复用 `pico_cart_cal.cfg`，保存 `force` 分组，不会覆盖已保存的轮速增益。
+本指南对应固件 `0.2.4`。拉力校准复用 `pico_cart_cal.cfg`，保存 `force` 分组，不会覆盖已保存的轮速增益。
 读数是相对原始量，不是公斤或牛顿。`tare` 零点和牵引会话基线每次卸载后重新建立，断电后不会自动恢复零点。
 
 ## 保存什么，不保存什么
@@ -9,7 +9,7 @@
 |---|---|
 | `left_force_gain` / `right_force_gain` | `tare` 零点 |
 | `start_raw` / `full_raw` | 牵引模式卸载基线 `lbase` / `rbase` |
-| `tow_left_comp` / `tow_right_comp` | 运行模式，不会因加载校准而自动进入牵引 |
+| `tow_left_comp` / `tow_right_comp` | 运行模式，不会因加载校准而自动进入牵引；进入后也不因蓝牙断开退出 |
 
 `tow_left_comp` / `tow_right_comp` 是牵引通道的原始补偿，和增益叠加。优先用增益对齐左右读数；补偿只用于安装偏差，不要两边同时加大。
 

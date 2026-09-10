@@ -35,6 +35,7 @@ object PicoProtocol {
         "manual_max",
         "timeout_ms",
         "reverse_neutral_ms",
+        "tow_idle_ms",
         "left_motor_gain",
         "right_motor_gain",
         "left_force_gain",
@@ -54,6 +55,7 @@ object PicoProtocol {
         "manual_max" to "0.25",
         "timeout_ms" to "1200",
         "reverse_neutral_ms" to "120",
+        "tow_idle_ms" to "300000",
         "left_motor_gain" to "1.00",
         "right_motor_gain" to "1.00",
         "left_force_gain" to "1.00",
@@ -67,6 +69,7 @@ object PicoProtocol {
         "decel_ramp" -> "停车斜坡（每 25ms PWM 减量）"
         "timeout_ms" -> "手动控制保活超时（毫秒）"
         "reverse_neutral_ms" -> "反向零位等待（毫秒）"
+        "tow_idle_ms" -> "牵引无拉力退出超时（毫秒，默认 5 分钟）"
         "left_motor_gain" -> "左轮增益"
         "right_motor_gain" -> "右轮增益"
         "left_force_gain" -> "左拉力增益"
