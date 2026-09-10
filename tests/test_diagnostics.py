@@ -343,6 +343,49 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertTrue(controller.apply_tow_idle_timeout(now))
         self.assertEqual(controller.mode, fw.MODE_IDLE)
 
+    def test_ota_accepts_hex_chunks_and_rejects_bad_crc(self):
+        import binascii
+        import tempfile
+        tmp = Path(tempfile.mkdtemp(prefix="pico_ota_"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+        previous = {
+            "staging": fw.OTA_STAGING_PATH,
+            "target": fw.OTA_TARGET_PATH,
+            "backup": fw.OTA_BACKUP_PATH,
+        }
+        fw.OTA_STAGING_PATH = str(tmp / "main.py.ota")
+        fw.OTA_TARGET_PATH = str(tmp / "main.py")
+        fw.OTA_BACKUP_PATH = str(tmp / "main.py.bak")
+        self.addCleanup(lambda: setattr(fw, "OTA_STAGING_PATH", previous["staging"]))
+        self.addCleanup(lambda: setattr(fw, "OTA_TARGET_PATH", previous["target"]))
+        self.addCleanup(lambda: setattr(fw, "OTA_BACKUP_PATH", previous["backup"]))
+        Path(fw.OTA_TARGET_PATH).write_text("old firmware\n", encoding="utf-8")
+        payload = b"# FIRMWARE_VERSION marker\nclass CartController:\n    pass\n"
+        crc = binascii.crc32(payload) & 0xFFFFFFFF
+        interface, _log = self.make_interface()
+        interface.handle("ota begin {} {:08x}".format(len(payload), crc))
+        replies = [call.args[0] for call in interface.ble.write.call_args_list]
+        self.assertTrue(any("ok ota_status" in text for text in replies), replies)
+        first = payload[:16]
+        second = payload[16:]
+        interface.handle("ota data 0 " + first.hex())
+        interface.handle("ota data {} {}".format(len(first), second.hex()))
+        replies = [call.args[0] for call in interface.ble.write.call_args_list]
+        self.assertTrue(any(text.startswith("ok ota_data") or "got=" in text for text in replies), replies)
+        interface.handle("ota end")
+        self.assertEqual(Path(fw.OTA_TARGET_PATH).read_bytes(), payload)
+        self.assertEqual(Path(fw.OTA_BACKUP_PATH).read_text(encoding="utf-8"), "old firmware\n")
+        reboot = [text for text in replies + [call.args[0] for call in interface.ble.write.call_args_list] if text.startswith("ok ota_reboot")]
+        self.assertTrue(reboot)
+
+        interface.ble.write.reset_mock()
+        interface.handle("ota begin {} {:08x}".format(len(payload), 0xDEADBEEF))
+        interface.handle("ota data 0 " + payload.hex())
+        interface.handle("ota end")
+        last = interface.ble.write.call_args.args[0]
+        self.assertTrue(last.startswith("err ota_crc"))
+        self.assertFalse(Path(fw.OTA_STAGING_PATH).exists())
+
     def test_set_tow_idle_ms_is_reported_in_params(self):
         previous_timeout = fw.TOW_IDLE_TIMEOUT_MS
         fw.TOW_IDLE_TIMEOUT_MS = 300000

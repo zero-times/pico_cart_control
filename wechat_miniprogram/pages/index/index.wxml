@@ -38,6 +38,7 @@
       <text>硬件诊断</text>
       <text class="muted mono">固件 {{firmware}} · {{linkStatus}}</text>
     </view>
+    <view class="muted diagnostic-note">{{firmwareUpdateStatus}}</view>
     <view class="diagnostic-row">
       <view>
         <text class="diagnostic-label">时间同步</text>

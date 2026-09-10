@@ -244,6 +244,8 @@ err unknown_cmd
 
 新版程序上电默认是 `idle`，不会自动进入拉力助力；蓝牙连接、传感器 `tare`、重启后都不会自动转动。只有在小程序或 App 里明确发 `auto`/`tow` 后，才进入自动牵引模式。进入后只有三种情况会退出：连续 `tow_idle_ms`（默认 5 分钟）没有拉力输入、手机主动发 `idle`/`stop`/`manual`/`tare` 等切模式命令，或断电。蓝牙断开、重连、前方障碍和急停都不会退出牵引模式。
 
+Android App 连接后会比较 Pico `fw=` 和手机内置固件包。从 `0.2.5` 起可用手机推送 `main.py`；细节见 `docs/PICO_FIRMWARE_OTA_GUIDE.md`。
+
 ## 微信小程序调试端
 
 小程序工程在：

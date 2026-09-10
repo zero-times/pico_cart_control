@@ -286,6 +286,9 @@ private fun PicoCartApp(
         },
         onConfirmClearHardwareLog = viewModel::confirmHardwareLogClear,
         onDismissClearHardwareLog = viewModel::dismissHardwareLogClear,
+        onRequestFirmwareUpdate = viewModel::requestFirmwareUpdate,
+        onConfirmFirmwareUpdate = viewModel::confirmFirmwareUpdate,
+        onDismissFirmwareUpdate = viewModel::dismissFirmwareUpdate,
         onToggleStream = viewModel::toggleStream,
         onPowerChange = viewModel::onPowerChange,
         onDrivePress = viewModel::holdDrive,
@@ -358,6 +361,9 @@ private fun PicoCartScreen(
     onShareHardwareLog: () -> Unit,
     onConfirmClearHardwareLog: () -> Unit,
     onDismissClearHardwareLog: () -> Unit,
+    onRequestFirmwareUpdate: () -> Unit,
+    onConfirmFirmwareUpdate: () -> Unit,
+    onDismissFirmwareUpdate: () -> Unit,
     onToggleStream: () -> Unit,
     onPowerChange: (Float) -> Unit,
     onDrivePress: (String) -> Unit,
@@ -390,6 +396,15 @@ private fun PicoCartScreen(
             text = { Text(prompt) },
             confirmButton = { TextButton(onClick = onConfirmClearHardwareLog) { Text("确认清理") } },
             dismissButton = { TextButton(onClick = onDismissClearHardwareLog) { Text("保留日志") } },
+        )
+    }
+    state.firmwareUpdatePrompt?.let { prompt ->
+        AlertDialog(
+            onDismissRequest = onDismissFirmwareUpdate,
+            title = { Text("更新 Pico 固件") },
+            text = { Text(prompt) },
+            confirmButton = { TextButton(onClick = onConfirmFirmwareUpdate) { Text("开始更新") } },
+            dismissButton = { TextButton(onClick = onDismissFirmwareUpdate) { Text("稍后") } },
         )
     }
     Box(Modifier.fillMaxSize()) {
@@ -553,6 +568,7 @@ private fun PicoCartScreen(
                                 onStatus = onStatus,
                                 onAuto = onAuto,
                                 onManual = onManual,
+                                onRequestFirmwareUpdate = onRequestFirmwareUpdate,
                             )
                         }
                         item { GamepadDebugPanel(gamepad = state.gamepadState) }
@@ -1604,6 +1620,7 @@ private fun DebugActionSection(
     onStatus: () -> Unit,
     onAuto: () -> Unit,
     onManual: () -> Unit,
+    onRequestFirmwareUpdate: () -> Unit,
 ) {
     Section(
         title = "工程操作",
@@ -1643,8 +1660,29 @@ private fun DebugActionSection(
             ActionButton(if (state.streaming) "关流" else "开流", Icons.Filled.PlayArrow, onToggleStream, enabled = state.cartReady)
         }
         Spacer(Modifier.height(10.dp))
-        Text("固件版本：${state.firmwareVersion} · 时钟：${state.clockSyncStatus}",
+        Text("Pico 固件：${state.firmwareVersion} · 手机包：${state.bundledFirmwareVersion}",
             style = MaterialTheme.typography.bodySmall)
+        Text(state.firmwareUpdateStatus, style = MaterialTheme.typography.bodySmall)
+        Text("时钟：${state.clockSyncStatus}", style = MaterialTheme.typography.bodySmall)
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            ActionButton(
+                if (state.firmwareUpdating) "推送中" else if (state.firmwareUpdateAvailable) "更新固件" else "检查固件",
+                Icons.Filled.Refresh,
+                onRequestFirmwareUpdate,
+                enabled = state.connected && !state.firmwareUpdating && (state.firmwareUpdateAvailable || state.firmwareOtaSupported),
+            )
+        }
+        if (state.firmwareUpdating) {
+            val total = state.firmwareUpdateTotal
+            if (total > 0) {
+                LinearProgressIndicator(
+                    progress = { state.firmwareUpdateReceived.toFloat() / total.toFloat() },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            } else {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            }
+        }
         if (state.linkStatus.isNotBlank()) {
             Text("连接：${state.linkStatus}${if (state.lastGattStatus.isNotBlank()) " · ${state.lastGattStatus}" else ""}",
                 style = MaterialTheme.typography.bodySmall)

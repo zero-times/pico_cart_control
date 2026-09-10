@@ -24,8 +24,10 @@ import com.zerotimes.picocart.logging.PersistentDebugLogStore
 import com.zerotimes.picocart.logging.HardwareLogExport
 import com.zerotimes.picocart.protocol.PicoProtocol
 import com.zerotimes.picocart.speech.MamboVoiceState
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -86,6 +88,14 @@ data class CartUiState(
     val mamboSpeechText: String = "",
     val mamboSpeechId: Long = 0L,
     val firmwareVersion: String = "未知",
+    val bundledFirmwareVersion: String = "未知",
+    val firmwareUpdateAvailable: Boolean = false,
+    val firmwareOtaSupported: Boolean = false,
+    val firmwareUpdateStatus: String = "未检测",
+    val firmwareUpdating: Boolean = false,
+    val firmwareUpdateReceived: Int = 0,
+    val firmwareUpdateTotal: Int = 0,
+    val firmwareUpdatePrompt: String? = null,
     val clockSyncStatus: String = "未同步",
     val clockSyncing: Boolean = false,
     val hardwareLogUsed: Int? = null,
@@ -233,6 +243,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var hardwareExportLastActivity = 0L
     private var clearSnapshotSequence: Long? = null
     private var mamboOverlayHideJob: Job? = null
+    private var firmwareUpdateJob: Job? = null
+    @Volatile private var firmwareUpdateGeneration = 0L
+    @Volatile private var pendingFirmwareAck: CompletableDeferred<String>? = null
     private var lastLogFile: File? = null
     private var identifyAfterConnected = false
     @Volatile private var lastHeartbeatElapsedMs = 0L
@@ -243,6 +256,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         persistentLogs.appendApp("session_start package=${application.packageName} app_log=${persistentLogs.appLogPath}")
         persistentLogs.appendVoice("session_start package=${application.packageName} voice_log=${persistentLogs.voiceLogPath}")
         addLog("persistent logs app=${persistentLogs.appLogPath} voice=${persistentLogs.voiceLogPath}")
+        loadBundledFirmwareInfo()
     }
 
     fun requiredBlePermissions(): Array<String> = client.requiredPermissions()
@@ -394,7 +408,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         clearSnapshotSequence = null
         _uiState.update { it.copy(clockSyncing = false, clockSyncStatus = "未同步", hardwareLogClearPrompt = null,
             hardwareLogClearBusy = false, hardwareLogExporting = false, hardwareLogUsed = null, hardwareLogCapacity = null,
-            hardwareLogUsedPercent = null, hardwareLogOverwritten = 0, firmwareVersion = "未知") }
+            hardwareLogUsedPercent = null, hardwareLogOverwritten = 0, firmwareVersion = "未知",
+            firmwareUpdateAvailable = false, firmwareOtaSupported = false, firmwareUpdating = false,
+            firmwareUpdateReceived = 0, firmwareUpdateTotal = 0, firmwareUpdatePrompt = null,
+            firmwareUpdateStatus = "未连接") }
+        abortFirmwareUpdate("Pico 已断开")
     }
 
     fun toggleStream() {
@@ -480,6 +498,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun sendCommand(command: String, logCommand: Boolean = true, hardwareClearConfirmed: Boolean = false): Boolean {
         if (!hardwareClearConfirmed && Regex("(?im)^\\s*hwlog\\s+clear\\b").containsMatchIn(command)) {
             requestHardwareLogClear()
+            return false
+        }
+        if (_uiState.value.firmwareUpdating && !command.trim().lowercase().startsWith("ota")) {
+            lastHardwareOperationError = "固件升级进行中"
+            addLog("command blocked: firmware updating")
             return false
         }
         val error = cartConnectionError()
@@ -877,7 +900,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         diagnosticsPollJob = viewModelScope.launch {
             while (isActive && generation == connectionGeneration && _uiState.value.connected) {
                 delay(30_000)
-                if (!_uiState.value.hardwareLogExporting) client.sendCommand("hwlog status", logCommand = false)
+                if (!_uiState.value.hardwareLogExporting && !_uiState.value.firmwareUpdating) {
+                    client.sendCommand("hwlog status", logCommand = false)
+                }
             }
         }
     }
@@ -888,7 +913,41 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             handleHardwareExportLine(line)
             return
         }
-        parsed["fw"]?.let { version -> _uiState.update { it.copy(firmwareVersion = version) } }
+        if (parsed.type == "info") {
+            val otaSupported = parsed["ota"] == "1"
+            val version = parsed["fw"].orEmpty().ifBlank { _uiState.value.firmwareVersion }
+            _uiState.update { state ->
+                state.copy(
+                    firmwareVersion = version.ifBlank { state.firmwareVersion },
+                    firmwareOtaSupported = otaSupported,
+                    firmwareUpdateAvailable = canOfferFirmwareUpdate(version, state.bundledFirmwareVersion, otaSupported),
+                    firmwareUpdateStatus = firmwareStatusText(
+                        deviceVersion = version.ifBlank { state.firmwareVersion },
+                        bundledVersion = state.bundledFirmwareVersion,
+                        otaSupported = otaSupported,
+                        updating = state.firmwareUpdating,
+                    ),
+                )
+            }
+        } else {
+            parsed["fw"]?.let { version ->
+                _uiState.update { state ->
+                    state.copy(
+                        firmwareVersion = version,
+                        firmwareUpdateAvailable = canOfferFirmwareUpdate(version, state.bundledFirmwareVersion, state.firmwareOtaSupported),
+                        firmwareUpdateStatus = firmwareStatusText(
+                            deviceVersion = version,
+                            bundledVersion = state.bundledFirmwareVersion,
+                            otaSupported = state.firmwareOtaSupported,
+                            updating = state.firmwareUpdating,
+                        ),
+                    )
+                }
+            }
+        }
+        if (line.startsWith("ok ota_") || (parsed.type == "err" && line.contains("ota"))) {
+            pendingFirmwareAck?.complete(line)
+        }
         if (parsed.type == "time") {
             val requested = pendingClockUnixMs
             val acknowledged = parsed["unix_ms"]?.toLongOrNull()
@@ -1051,6 +1110,187 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun requestFirmwareUpdate() {
+        val state = _uiState.value
+        if (!state.connected || state.firmwareUpdating) return
+        if (!state.firmwareOtaSupported) {
+            _uiState.update { it.copy(firmwareUpdateStatus = "当前 Pico 固件还不支持手机推送升级") }
+            return
+        }
+        if (bundledFirmwareBytes() == null) {
+            _uiState.update { it.copy(firmwareUpdateStatus = "手机里没有可用的固件包") }
+            return
+        }
+        val bundled = state.bundledFirmwareVersion
+        _uiState.update {
+            it.copy(
+                firmwareUpdatePrompt = "将 Pico 固件从 ${state.firmwareVersion} 更新到 $bundled？升级期间小车会停车，完成后自动重启。",
+            )
+        }
+    }
+
+    fun dismissFirmwareUpdate() {
+        _uiState.update { it.copy(firmwareUpdatePrompt = null) }
+    }
+
+    fun confirmFirmwareUpdate() {
+        if (_uiState.value.firmwareUpdatePrompt == null) return
+        dismissFirmwareUpdate()
+        startFirmwareUpdate()
+    }
+
+    private fun loadBundledFirmwareInfo() {
+        val source = bundledFirmwareText() ?: return
+        val version = PicoProtocol.extractFirmwareVersion(source) ?: "未知"
+        _uiState.update { it.copy(bundledFirmwareVersion = version, firmwareUpdateStatus = "手机固件包 $version") }
+    }
+
+    private fun bundledFirmwareText(): String? = bundledFirmwareBytes()?.toString(Charsets.UTF_8)
+
+    private fun bundledFirmwareBytes(): ByteArray? {
+        return runCatching {
+            getApplication<Application>().assets.open(PicoProtocol.bundledFirmwareFile).use { it.readBytes() }
+        }.getOrNull()
+    }
+
+    private fun canOfferFirmwareUpdate(deviceVersion: String, bundledVersion: String, otaSupported: Boolean): Boolean {
+        if (!otaSupported || deviceVersion in setOf("", "-", "未知") || bundledVersion in setOf("", "-", "未知")) {
+            return false
+        }
+        return PicoProtocol.compareVersions(bundledVersion, deviceVersion) > 0
+    }
+
+    private fun firmwareStatusText(
+        deviceVersion: String,
+        bundledVersion: String,
+        otaSupported: Boolean,
+        updating: Boolean,
+    ): String {
+        if (updating) return _uiState.value.firmwareUpdateStatus
+        if (!otaSupported) return "当前固件不支持手机推送升级，需要先用电脑刷入 0.2.5 或更新版本"
+        if (deviceVersion in setOf("", "-", "未知")) return "等待读取 Pico 版本"
+        return when (PicoProtocol.compareVersions(bundledVersion, deviceVersion)) {
+            1 -> "发现新固件 $bundledVersion，可推送到 Pico"
+            0 -> "已是手机内置固件 $bundledVersion"
+            else -> "Pico 固件 $deviceVersion 比手机包 $bundledVersion 更新"
+        }
+    }
+
+    private fun startFirmwareUpdate() {
+        val payload = bundledFirmwareBytes() ?: run {
+            _uiState.update { it.copy(firmwareUpdateStatus = "手机里没有可用的固件包") }
+            return
+        }
+        if (!_uiState.value.connected || _uiState.value.firmwareUpdating) return
+        firmwareUpdateJob?.cancel()
+        val generation = ++firmwareUpdateGeneration
+        firmwareUpdateJob = viewModelScope.launch {
+            pushFirmware(payload, generation)
+        }
+    }
+
+    private fun abortFirmwareUpdate(reason: String) {
+        firmwareUpdateGeneration += 1
+        firmwareUpdateJob?.cancel()
+        firmwareUpdateJob = null
+        pendingFirmwareAck?.complete("err ota_abort")
+        pendingFirmwareAck = null
+        if (_uiState.value.firmwareUpdating || _uiState.value.firmwareUpdateStatus != reason) {
+            _uiState.update {
+                it.copy(
+                    firmwareUpdating = false,
+                    firmwareUpdatePrompt = null,
+                    firmwareUpdateStatus = reason,
+                )
+            }
+        }
+    }
+
+    private suspend fun pushFirmware(payload: ByteArray, generation: Long) {
+        val crc = PicoProtocol.crc32Hex(payload)
+        val total = payload.size
+        _uiState.update {
+            it.copy(
+                firmwareUpdating = true,
+                firmwareUpdateReceived = 0,
+                firmwareUpdateTotal = total,
+                firmwareUpdateStatus = "正在停车并开始推送固件",
+            )
+        }
+        addLog("ota begin size=$total crc=$crc")
+        val begin = awaitFirmwareReply("ota begin $total $crc", generation, timeoutMs = 8_000) ?: return
+        if (!begin.startsWith("ok ota_status")) {
+            failFirmwareUpdate("Pico 拒绝升级：$begin")
+            return
+        }
+        var offset = 0
+        while (offset < total) {
+            if (generation != firmwareUpdateGeneration || !_uiState.value.connected) return
+            val end = minOf(offset + PicoProtocol.otaChunkBytes, total)
+            val chunk = payload.copyOfRange(offset, end)
+            val hex = chunk.joinToString("") { byte -> "%02x".format(byte.toInt() and 0xFF) }
+            val reply = awaitFirmwareReply("ota data $offset $hex", generation, timeoutMs = 8_000, logCommand = false)
+                ?: return
+            if (!(reply.startsWith("ok ota_data") || reply.startsWith("ok ota_status"))) {
+                failFirmwareUpdate("推送中断：$reply")
+                return
+            }
+            offset = end
+            _uiState.update {
+                it.copy(
+                    firmwareUpdateReceived = offset,
+                    firmwareUpdateStatus = "正在推送固件 $offset / $total",
+                )
+            }
+        }
+        val done = awaitFirmwareReply("ota end", generation, timeoutMs = 12_000) ?: return
+        if (!done.startsWith("ok ota_reboot") && !done.startsWith("ok ota_restarting")) {
+            failFirmwareUpdate("Pico 未确认重启：$done")
+            return
+        }
+        _uiState.update {
+            it.copy(
+                firmwareUpdating = false,
+                firmwareUpdateReceived = total,
+                firmwareUpdateTotal = total,
+                firmwareUpdateAvailable = false,
+                firmwareUpdateStatus = "固件已写入，Pico 正在重启，请重新连接",
+            )
+        }
+        addLog("ota complete crc=$crc")
+    }
+
+    private suspend fun awaitFirmwareReply(
+        command: String,
+        generation: Long,
+        timeoutMs: Long,
+        logCommand: Boolean = true,
+    ): String? {
+        if (generation != firmwareUpdateGeneration || !_uiState.value.connected) return null
+        val ack = CompletableDeferred<String>()
+        pendingFirmwareAck = ack
+        client.sendCommand(command, logCommand)
+        val reply = withTimeoutOrNull(timeoutMs) { ack.await() }
+        if (pendingFirmwareAck === ack) pendingFirmwareAck = null
+        if (generation != firmwareUpdateGeneration) return null
+        if (reply == null) {
+            failFirmwareUpdate("升级响应超时，请靠近 Pico 后重试")
+            client.sendCommand("ota abort", logCommand = true)
+        }
+        return reply
+    }
+
+    private fun failFirmwareUpdate(message: String) {
+        addLog(message)
+        _uiState.update {
+            it.copy(
+                firmwareUpdating = false,
+                firmwareUpdatePrompt = null,
+                firmwareUpdateStatus = message,
+            )
+        }
+    }
+
     private fun addLog(message: String) {
         persistentLogs.appendApp(message)
         val entry = LogEntry(
@@ -1172,7 +1412,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun requestHeartbeat() {
-        if (_uiState.value.connected) {
+        if (_uiState.value.connected && !_uiState.value.firmwareUpdating) {
             client.sendCommand("status", logCommand = false)
         }
     }

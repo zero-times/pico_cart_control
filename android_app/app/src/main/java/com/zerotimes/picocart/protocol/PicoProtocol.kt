@@ -112,4 +112,47 @@ object PicoProtocol {
     }
 
     fun normalizeUuid(uuid: String?): String = uuid.orEmpty().uppercase(Locale.US)
+
+    const val bundledFirmwareFile = "pico_firmware/main.py"
+    const val otaChunkBytes = 96
+
+    fun compareVersions(left: String, right: String): Int {
+        val leftParts = versionParts(left)
+        val rightParts = versionParts(right)
+        val size = maxOf(leftParts.size, rightParts.size)
+        for (index in 0 until size) {
+            val delta = leftParts.getOrElse(index) { 0 } - rightParts.getOrElse(index) { 0 }
+            if (delta != 0) return if (delta > 0) 1 else -1
+        }
+        return 0
+    }
+
+    private fun versionParts(value: String): List<Int> {
+        return value.trim().lowercase(Locale.US)
+            .split(Regex("[^0-9]+"))
+            .filter { it.isNotBlank() }
+            .mapNotNull { it.toIntOrNull() }
+    }
+
+    fun crc32(data: ByteArray): Int {
+        var crc = 0xFFFFFFFF.toInt()
+        for (byte in data) {
+            crc = crc xor (byte.toInt() and 0xFF)
+            repeat(8) {
+                crc = if (crc and 1 != 0) {
+                    (crc ushr 1) xor 0xEDB88320.toInt()
+                } else {
+                    crc ushr 1
+                }
+            }
+        }
+        return crc xor 0xFFFFFFFF.toInt()
+    }
+
+    fun crc32Hex(data: ByteArray): String = "%08x".format(Locale.US, crc32(data).toLong() and 0xFFFFFFFFL)
+
+    fun extractFirmwareVersion(source: String): String? {
+        val match = Regex("""FIRMWARE_VERSION\s*=\s*["']([^"']+)["']""").find(source)
+        return match?.groupValues?.get(1)
+    }
 }

@@ -144,6 +144,9 @@ Page({
     logAnchor: '',
     info: {},
     firmware: '-',
+    firmwareOta: '0',
+    bundledFirmware: '0.2.5',
+    firmwareUpdateStatus: '连接后检测 Pico 固件',
     timeSyncState: '未同步',
     timeSyncDetail: '连接后自动同步手机时间',
     linkStatus: '未连接',
@@ -699,7 +702,14 @@ Page({
     } else if (parsed.type === 'err' && /tare|sensor_not_ready/.test(line)) {
       this.setData({ tareStatus: `归零或牵引失败：${line}` })
     } else if (parsed.type === 'info') {
-      this.setData({ info: parsed, firmware: parsed.fw || this.data.firmware })
+      const firmware = parsed.fw || this.data.firmware
+      const ota = parsed.ota === '1' ? '1' : '0'
+      this.setData({
+        info: parsed,
+        firmware,
+        firmwareOta: ota,
+        firmwareUpdateStatus: this.firmwareStatusText(firmware, ota)
+      })
     } else if (parsed.type === 'ok' && parsed.stream) {
       this.setData({ streaming: parsed.stream === 'on' })
     }
@@ -1019,6 +1029,15 @@ Page({
   shareHardwareLogs() {
     if (!this.hardwareSavedFile) return
     this.shareSavedFile(this.hardwareSavedFile)
+  },
+
+  firmwareStatusText(firmware, ota) {
+    if (ota !== '1') {
+      return '当前固件还不能由手机推包升级，请先用电脑刷入 0.2.5 或更新版本；之后用 Android App 推送。'
+    }
+    if (!firmware || firmware === '-') return '已支持推包升级，等待读取版本'
+    if (firmware === this.data.bundledFirmware) return `已是 ${firmware}`
+    return `Pico ${firmware}，手机参考包 ${this.data.bundledFirmware}。请用 Android App 推送固件包。`
   },
 
   sendStatus() {
